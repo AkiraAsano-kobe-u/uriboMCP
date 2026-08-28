@@ -1,0 +1,17 @@
+# Copy this table into %USERPROFILE%\\.codex\\config.toml, then replace both paths.
+# Keep the paths quoted: Windows paths can contain spaces and non-ASCII characters.
+[mcp_servers.uribo-mcp]
+command = "uv"
+args = [
+  "--directory",
+  "C:\\Users\\YOUR_USER\\Documents\\uriboMCP",
+  "run",
+  "uribo-mcp",
+  "serve",
+]
+cwd = "C:\\Users\\YOUR_USER\\Documents\\uriboMCP"
+startup_timeout_sec = 20
+tool_timeout_sec = 60
+
+[mcp_servers.uribo-mcp.env]
+URIBO_MCP_CONFIG = "C:\\Users\\YOUR_USER\\Documents\\uriboMCP\\config.local.toml"

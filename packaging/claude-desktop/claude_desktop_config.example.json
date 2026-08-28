@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "uribo-mcp": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "C:\\Users\\YOUR_USER\\Documents\\uriboMCP",
+        "run",
+        "uribo-mcp",
+        "serve"
+      ],
+      "env": {
+        "URIBO_MCP_CONFIG": "C:\\Users\\YOUR_USER\\Documents\\uriboMCP\\config.local.toml"
+      }
+    }
+  }
+}

@@ -1,0 +1,15 @@
+# Never package local state, credentials, caches, or development-only files.
+.git/
+.venv/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+credentials/
+data/
+exports/
+debug/
+tests/
+config.local.toml
+.env
+.env.*
+*.log

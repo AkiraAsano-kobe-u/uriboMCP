@@ -1,0 +1,31 @@
+[paths]
+data_dir = "data"
+cache_dir = "data/cache"
+export_root = "exports"
+credentials_dir = "credentials"
+
+[sync]
+enabled_sources = ["csi", "pdf_calendar", "newsnet", "beef", "venture", "uribo", "mail"]
+request_interval_seconds = 3.0
+source_interval_seconds = 5.0
+job_stale_hours = 6
+
+[documents]
+max_file_bytes = 104857600
+max_pdf_pages = 1000
+chunk_chars = 4000
+chunk_overlap_chars = 400
+ocr_min_chars_per_page = 40
+tesseract_command = "tesseract"
+ocr_languages = "jpn+jpn_vert+eng"
+
+[mcp]
+default_limit = 20
+max_limit = 200
+max_text_chars = 16000
+
+[features]
+google_calendar_sync = false
+ocr = true
+office_documents = true
+

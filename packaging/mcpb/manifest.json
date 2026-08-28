@@ -1,0 +1,46 @@
+{
+  "manifest_version": "0.4",
+  "name": "uribo-mcp",
+  "display_name": "uriboMCP",
+  "version": "0.1.0",
+  "description": "Local MCP server for Kobe University course and campus information.",
+  "author": {
+    "name": "uriboMCP contributors"
+  },
+  "server": {
+    "type": "uv",
+    "entry_point": "src/uribo_mcp/__main__.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "${__dirname}",
+        "run",
+        "uribo-mcp",
+        "serve"
+      ],
+      "env": {
+        "URIBO_MCP_CONFIG": "${user_config.config_path}"
+      }
+    }
+  },
+  "compatibility": {
+    "platforms": [
+      "win32"
+    ]
+  },
+  "user_config": {
+    "config_path": {
+      "type": "file",
+      "title": "uriboMCP configuration file",
+      "description": "Select your local config.local.toml. It must not contain credentials in this bundle.",
+      "required": true
+    }
+  },
+  "tools_generated": true,
+  "keywords": [
+    "kobe-university",
+    "lms",
+    "coursework"
+  ]
+}
