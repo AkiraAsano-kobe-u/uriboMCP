@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -75,6 +76,10 @@ def test_scripts_are_present_and_do_not_modify_user_client_configurations() -> N
         assert "claude mcp add" not in text or "register-claude-code-user.ps1" in generator
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="Windows client-material generation; asserts a project root with Japanese characters",
+)
 def test_generator_and_doctor_preserve_absolute_unicode_paths(tmp_path: Path) -> None:
     powershell = shutil.which("pwsh") or shutil.which("powershell")
     if not powershell:
