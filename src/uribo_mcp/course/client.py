@@ -34,6 +34,12 @@ class Session(Protocol):
     def post(self, url: str, **kwargs: Any) -> Response: ...
 
 
+def safe_file_name(value: str) -> str:
+    """NFC-normalised file name without path separators or control characters."""
+    value = unicodedata.normalize("NFC", value)
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value).strip(" .")[:180] or "attachment"
+
+
 @dataclass(frozen=True)
 class DownloadedFile:
     path: Path
@@ -424,10 +430,7 @@ class BeefReadOnlyClient:
             or "attachment"
         )
 
-    @staticmethod
-    def _safe_name(value: str) -> str:
-        value = unicodedata.normalize("NFC", value)
-        return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value).strip(" .")[:180] or "attachment"
+    _safe_name = staticmethod(safe_file_name)
 
 
-__all__ = ["BeefReadOnlyClient", "DownloadedFile"]
+__all__ = ["BeefReadOnlyClient", "DownloadedFile", "safe_file_name"]

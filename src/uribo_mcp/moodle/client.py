@@ -3,14 +3,16 @@
 BEEF (``https://beef.center.kobe-u.ac.jp/<academic year>/``) is a Moodle 4.x
 site separate from BEEF+.  Quizzes, assignment submission and forum posting
 are reachable through the same session, so this client exposes a small
-allowlist of view pages, file downloads and three read-only AJAX functions.
-Callers supply a ``requests.Session`` that already carries Moodle cookies.
+allowlist of view pages, file downloads and two read-only AJAX functions.
+Redirects are followed manually so every hop is checked against the same
+allowlist.  Callers supply a ``requests.Session`` that carries Moodle cookies.
 """
 
 from __future__ import annotations
 
 import json
 import mimetypes
+import os
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -19,9 +21,16 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
-from uribo_mcp.course.client import DownloadedFile, Session
+from uribo_mcp.course.client import DownloadedFile, safe_file_name
 
 HOST = "beef.center.kobe-u.ac.jp"
+REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+_MAX_REDIRECTS = 5
+_SESSION_ERRORS = frozenset({"servicerequireslogin", "invalidsesskey", "requireloginerror"})
+
+
+class MoodleSessionExpired(PermissionError):
+    """The Moodle session cookie is no longer valid; a new SSO login is needed."""
 
 
 def academic_year(now: datetime | None = None) -> int:
@@ -36,7 +45,7 @@ def moodle_base_url(year: int | None = None) -> str:
 
 @dataclass
 class MoodleReadOnlyClient:
-    session: Session
+    session: Any
     base_url: str = field(default_factory=moodle_base_url)
     timeout_seconds: int = 60
     user_agent: str = "uribo-mcp/0.1 (personal read-only course sync)"
@@ -56,7 +65,7 @@ class MoodleReadOnlyClient:
             "/mod/forum/discuss.php",
         }
     )
-    _GET_PREFIXES = ("/pluginfile.php/",)
+    _FILE_PREFIX = "/pluginfile.php/"
     _AJAX_PATH = "/lib/ajax/service.php"
     AJAX_METHODS = frozenset(
         {
@@ -86,13 +95,17 @@ class MoodleReadOnlyClient:
             raise PermissionError(f"Refusing a path outside {self._prefix}: {path}")
         return path[len(self._prefix):]
 
-    def _assert_allowed(self, method: str, url: str, params: dict | None = None) -> None:
+    def _is_login_url(self, url: str) -> bool:
+        parsed = urlparse(url)
+        return (
+            parsed.netloc != self._host
+            or "/login/" in parsed.path
+            or "/auth/shibboleth" in parsed.path
+        )
+
+    def _assert_allowed(self, url: str, params: dict | None = None) -> None:
         path = self._local_path(url)
-        if method == "POST":
-            if path != self._AJAX_PATH:
-                raise PermissionError(f"Refusing a Moodle POST endpoint: {path}")
-            return
-        if path.startswith(self._GET_PREFIXES):
+        if path.startswith(self._FILE_PREFIX):
             return
         if path not in self._GET_PATHS:
             raise PermissionError(f"Endpoint is outside the read-only allowlist: {path}")
@@ -101,15 +114,11 @@ class MoodleReadOnlyClient:
         if blocked:
             raise PermissionError(f"Refusing action parameters {sorted(blocked)} on {path}")
 
-    def _assert_authenticated(self, response: Any) -> None:
-        final = urlparse(response.url)
-        path = final.path
-        if (
-            final.netloc != self._host
-            or "/login/" in path
-            or "/auth/shibboleth" in path
-        ):
-            raise PermissionError("Moodle session expired; a new SSO login is required")
+    def is_file_url(self, url: str) -> bool:
+        try:
+            return self._local_path(self._url(url)).startswith(self._FILE_PREFIX)
+        except (PermissionError, ValueError):
+            return False
 
     # ---------------------------------------------------------------- requests
     def _get(
@@ -117,23 +126,46 @@ class MoodleReadOnlyClient:
         value: str,
         *,
         params: dict[str, Any] | None = None,
-        allow_redirects: bool = True,
+        follow: bool = True,
         stream: bool = False,
     ):
+        """GET with manual redirects; every hop is re-checked against the allowlist.
+
+        A hop to KNOSSOS/IdP or to Moodle's login pages raises
+        MoodleSessionExpired.  With ``follow=False`` a redirect response is
+        returned (closed, body unread) so the caller can inspect ``Location``.
+        """
         url = self._url(value)
-        self._assert_allowed("GET", url, params)
-        response = self.session.get(
-            url,
-            params=params,
-            headers={"User-Agent": self.user_agent},
-            timeout=self.timeout_seconds,
-            allow_redirects=allow_redirects,
-            stream=stream,
-        )
-        if allow_redirects:
-            response.raise_for_status()
-            self._assert_authenticated(response)
-        return response
+        self._assert_allowed(url, params)
+        for _ in range(_MAX_REDIRECTS + 1):
+            response = self.session.get(
+                url,
+                params=params,
+                headers={"User-Agent": self.user_agent},
+                timeout=self.timeout_seconds,
+                allow_redirects=False,
+                stream=stream,
+            )
+            if response.status_code not in REDIRECT_CODES:
+                try:
+                    if self._is_login_url(str(response.url)):
+                        raise MoodleSessionExpired(
+                            "Moodle session expired; a new SSO login is required"
+                        )
+                    response.raise_for_status()
+                except Exception:
+                    response.close()
+                    raise
+                return response
+            location = urljoin(url, response.headers.get("Location") or "")
+            response.close()
+            if self._is_login_url(location):
+                raise MoodleSessionExpired("Moodle session expired; a new SSO login is required")
+            if not follow:
+                return response
+            url, params = self._url(location), None
+            self._assert_allowed(url)
+        raise RuntimeError(f"Too many redirects from {value}")
 
     def fetch_page(self, value: str, *, params: dict[str, Any] | None = None) -> str:
         return self._get(value, params=params).text
@@ -145,6 +177,10 @@ class MoodleReadOnlyClient:
 
     def fetch_course(self, course_id: int | str) -> str:
         return self.fetch_page("course/view.php", params={"id": str(course_id)})
+
+    @property
+    def has_session_key(self) -> bool:
+        return bool(self._sesskey)
 
     def configure_sesskey(self, html: str) -> str | None:
         match = re.search(r'"sesskey"\s*:\s*"([^"]+)"', html)
@@ -158,9 +194,8 @@ class MoodleReadOnlyClient:
         if not self._sesskey:
             self.fetch_my_courses()
         if not self._sesskey:
-            raise PermissionError("Moodle page did not expose a session key")
-        url = self._url("lib/ajax/service.php")
-        self._assert_allowed("POST", url)
+            raise MoodleSessionExpired("Moodle page did not expose a session key")
+        url = self._url(self._AJAX_PATH.lstrip("/"))
         response = self.session.post(
             url,
             params={"sesskey": self._sesskey, "info": method},
@@ -173,16 +208,21 @@ class MoodleReadOnlyClient:
             timeout=self.timeout_seconds,
             allow_redirects=False,
         )
+        if response.status_code in REDIRECT_CODES:
+            raise MoodleSessionExpired("Moodle AJAX redirected; a new SSO login is required")
         response.raise_for_status()
-        payload = json.loads(response.text)
-        if not isinstance(payload, list) or not payload:
-            raise ValueError(f"Unexpected Moodle AJAX payload for {method}")
+        try:
+            payload = json.loads(response.text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Moodle AJAX {method} returned non-JSON") from exc
+        if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
+            raise RuntimeError(f"Unexpected Moodle AJAX payload for {method}")
         first = payload[0]
         if first.get("error"):
             exception = first.get("exception") or {}
             code = exception.get("errorcode")
-            if code in {"servicerequireslogin", "invalidsesskey", "requireloginerror"}:
-                raise PermissionError("Moodle session expired; a new SSO login is required")
+            if code in _SESSION_ERRORS:
+                raise MoodleSessionExpired("Moodle session expired; a new SSO login is required")
             raise RuntimeError(f"Moodle AJAX {method} failed: {code or exception}")
         return first.get("data")
 
@@ -214,32 +254,17 @@ class MoodleReadOnlyClient:
 
     def resolve_resource_file(self, cmid: int | str) -> str | None:
         """Return the pluginfile URL behind a file resource without downloading it."""
-        response = self._get(
-            "mod/resource/view.php",
-            params={"id": str(cmid), "redirect": "1"},
-            allow_redirects=False,
-        )
-        location = response.headers.get("Location") or ""
-        if response.status_code in {301, 302, 303, 307, 308} and location:
-            target = self._url(location)
-            if self._is_pluginfile(target):
-                return target
-            self._assert_authenticated(_Final(target))
-            return None
-        response.raise_for_status()
-        self._assert_authenticated(response)
+        start = self._url("mod/resource/view.php")
+        response = self._get(start, params={"id": str(cmid), "redirect": "1"}, follow=False)
+        if response.status_code in REDIRECT_CODES:
+            target = urljoin(start, response.headers.get("Location") or "")
+            return target.split("?", 1)[0] if self.is_file_url(target) else None
         from uribo_mcp.moodle.parser import pluginfile_links
 
         links = pluginfile_links(response.text, base_url=self.base_url)
         return links[0]["url"] if links else None
 
     # ---------------------------------------------------------------- download
-    def _is_pluginfile(self, url: str) -> bool:
-        try:
-            return self._local_path(url).startswith(self._GET_PREFIXES)
-        except PermissionError:
-            return False
-
     def download_attachment(
         self,
         attachment: dict[str, Any],
@@ -247,56 +272,53 @@ class MoodleReadOnlyClient:
         destination_dir: Path,
         max_bytes: int = 100 * 1024 * 1024,
     ) -> DownloadedFile:
-        source_url = str(attachment.get("url") or attachment.get("source_url") or "")
-        url = self._url(source_url)
-        if not self._is_pluginfile(url):
+        url = self._url(str(attachment.get("url") or attachment.get("source_url") or ""))
+        if not self.is_file_url(url):
             raise PermissionError(f"Only pluginfile downloads are allowed: {url}")
-        destination_dir.mkdir(parents=True, exist_ok=True)
-        response = self._get(url, params={"forcedownload": "1"}, stream=True)
-        try:
-            declared = response.headers.get("Content-Length")
-            if declared and int(declared) > max_bytes:
-                raise ValueError(f"Attachment exceeds size limit: {declared} > {max_bytes}")
-            chunks: list[bytes] = []
-            total = 0
-            for chunk in response.iter_content(chunk_size=1 << 16):
-                total += len(chunk)
-                if total > max_bytes:
-                    raise ValueError(f"Attachment exceeds size limit: > {max_bytes}")
-                chunks.append(chunk)
-            content = b"".join(chunks)
-        finally:
-            response.close()
         file_name = self.file_name_from_url(url) or str(attachment.get("name") or "attachment")
-        target = (destination_dir / self._safe_name(file_name)).resolve()
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        target = (destination_dir / safe_file_name(file_name)).resolve()
         if destination_dir.resolve() not in target.parents:
             raise ValueError("Attachment path escaped the cache directory")
-        target.write_bytes(content)
+        temporary = target.with_name(target.name + ".part")
+        response = self._get(url, params={"forcedownload": "1"}, stream=True)
+        total = 0
+        try:
+            declared = str(response.headers.get("Content-Length") or "")
+            if declared.isdigit() and int(declared) > max_bytes:
+                raise ValueError(f"Attachment exceeds size limit: {declared} > {max_bytes}")
+            with temporary.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=1 << 16):
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError(f"Attachment exceeds size limit: > {max_bytes}")
+                    handle.write(chunk)
+            os.replace(temporary, target)
+        finally:
+            response.close()
+            temporary.unlink(missing_ok=True)
         media_type = response.headers.get("Content-Type") or mimetypes.guess_type(file_name)[0]
         return DownloadedFile(
             path=target,
             file_name=file_name,
             media_type=media_type.split(";", 1)[0] if media_type else None,
-            size_bytes=len(content),
-            response_url=response.url,
+            size_bytes=total,
+            response_url=str(response.url),
         )
 
     @staticmethod
     def file_name_from_url(url: str) -> str | None:
-        # Moodle sends RFC 2231-less non-ASCII Content-Disposition values that
-        # requests decodes as Latin-1; the pluginfile path carries the real name.
+        # Moodle sends a raw UTF-8 Content-Disposition that requests decodes as
+        # Latin-1; the pluginfile path carries the real name.
         name = PurePosixPath(unquote(urlparse(url).path)).name
         return unicodedata.normalize("NFC", name) if name else None
 
-    @staticmethod
-    def _safe_name(value: str) -> str:
-        value = unicodedata.normalize("NFC", value)
-        return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value).strip(" .")[:180] or "attachment"
 
-
-@dataclass(frozen=True)
-class _Final:
-    url: str
-
-
-__all__ = ["HOST", "MoodleReadOnlyClient", "academic_year", "moodle_base_url"]
+__all__ = [
+    "HOST",
+    "REDIRECT_CODES",
+    "MoodleReadOnlyClient",
+    "MoodleSessionExpired",
+    "academic_year",
+    "moodle_base_url",
+]

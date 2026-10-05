@@ -143,20 +143,43 @@ def authenticated_lms(
         driver.quit()
 
 
-@contextmanager
-def authenticated_moodle(
+def _restore_moodle(
+    vault: CookieVault, source: str, base_url: str
+) -> MoodleReadOnlyClient | None:
+    """Client from saved cookies if they still open ``my/courses.php``."""
+    cookies = vault.load(source)
+    if not cookies:
+        return None
+    client = MoodleReadOnlyClient(_requests_from_cookies(cookies), base_url=base_url)
+    try:
+        client.fetch_my_courses()
+    except PermissionError:
+        return None
+    return client if client.has_session_key else None
+
+
+def open_moodle(
     settings: Settings,
     *,
     base_url: str | None = None,
     source: str = "moodle",
-) -> Iterator[MoodleReadOnlyClient]:
-    """Open LMS BEEF (Moodle) with saved cookies, else exactly one SSO login."""
+    driver_factory=None,
+    login=None,
+) -> MoodleReadOnlyClient:
+    """Return a signed-in Moodle client: saved cookies first, else one SSO login.
+
+    ``driver_factory``/``login`` are injectable for tests; the real login
+    submits the KNOSSOS form at most once and never retries.
+    """
     from uribo_mcp.moodle.client import moodle_base_url
 
     base_url = (base_url or moodle_base_url()).rstrip("/")
     host = urlparse(base_url).hostname or ""
     landing = f"{base_url}/my/courses.php"
     vault = CookieVault(settings.paths.credentials_dir)
+    restored = _restore_moodle(vault, source, base_url)
+    if restored is not None:
+        return restored
 
     def signed_in(url: str) -> bool:
         parsed = urlparse(url)
@@ -166,23 +189,12 @@ def authenticated_moodle(
             and "/auth/shibboleth" not in parsed.path
         )
 
-    cookies = vault.load(source)
-    if cookies:
-        client = MoodleReadOnlyClient(_requests_from_cookies(cookies), base_url=base_url)
-        try:
-            restored = bool(client.configure_sesskey(client.fetch_my_courses()))
-        except PermissionError:
-            restored = False
-        if restored:
-            # Yield outside the try so a caller's PermissionError propagates.
-            yield client
-            return
-    driver = make_chrome_driver()
+    driver = (driver_factory or make_chrome_driver)()
     try:
         _inject_vault(driver, vault, source, f"https://{host}")
         driver.get(landing)
         if not signed_in(driver.current_url):
-            _login_once(driver, landing, host)
+            (login or _login_once)(driver, landing, host)
             driver.get(landing)
         if not signed_in(driver.current_url):
             raise AuthenticationRequired(f"Could not open authenticated Moodle page: {landing}")
@@ -191,8 +203,8 @@ def authenticated_moodle(
     finally:
         driver.quit()
     client = MoodleReadOnlyClient(session, base_url=base_url)
-    client.fetch_my_courses()
-    yield client
+    client.fetch_my_courses()  # also loads the AJAX session key
+    return client
 
 
 def _requests_from_cookies(cookies: list[dict]) -> requests.Session:
@@ -311,4 +323,5 @@ __all__ = [
     "gmail_service",
     "google_token_summary",
     "make_chrome_driver",
+    "open_moodle",
 ]

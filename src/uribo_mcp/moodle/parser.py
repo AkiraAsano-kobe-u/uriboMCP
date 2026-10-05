@@ -1,7 +1,8 @@
 """Parsers for Moodle 4.x pages served by LMS BEEF.
 
 Only stable Moodle markers are used: ``li.activity[data-id]`` with a
-``modtype_<module>`` class, ``li.section[data-sectionname]`` and URLs such as
+``modtype_<module>`` class, section ``li`` elements carrying
+``data-number``/``data-sectionname`` and URLs such as
 ``/mod/<module>/view.php?id=<cmid>`` and ``/pluginfile.php/``.
 """
 
@@ -16,7 +17,8 @@ from bs4 import BeautifulSoup, Tag
 
 JST = timezone(timedelta(hours=9))
 
-# Moodle module -> uribo item category.  Modules missing here are skipped.
+# Moodle module -> uribo item category.  Modules missing here are skipped
+# (e.g. ``subsection`` containers, whose activities are parsed on their own).
 CATEGORY_BY_MODULE = {
     "resource": "material",
     "folder": "material",
@@ -34,36 +36,49 @@ CATEGORY_BY_MODULE = {
 # Pages that are safe to open for their body text (no attempt/submit side effects).
 DETAIL_MODULES = frozenset({"page", "folder", "assign"})
 
+_SECTION_SELECTOR = "li.section[data-number], li.course-section[data-number]"
+_HIDDEN_SELECTOR = ".accesshide, .sr-only, .visually-hidden, script, style"
+# Calendar event types and their strength.  ``gradingdue`` (the teacher's
+# grading deadline) and unknown types never set a student deadline.
+_DEADLINE_EVENT_RANK = {"due": 3, "close": 3, "expectcompletionon": 1}
+_OPEN_EVENTS = frozenset({"open", "allowsubmissionsfromdate"})
+_DEADLINE_LABEL = re.compile(r"^(?:期限|終了日時|終了|Due|Closes?)$", re.IGNORECASE)
+_STATUS_LABEL = re.compile(r"提出ステータス|Submission status", re.IGNORECASE)
+
 
 def _clean(value: str | None) -> str:
     return re.sub(r"[\s\u3000]+", " ", value or "").strip()
 
 
-def _text(element: Tag | None, *, sep: str = " ") -> str:
-    if element is None:
-        return ""
+def _visible_copy(element: Tag) -> BeautifulSoup:
     copy = BeautifulSoup(str(element), "html.parser")
-    for hidden in copy.select(".accesshide, .sr-only, .visually-hidden, script, style"):
+    for hidden in copy.select(_HIDDEN_SELECTOR):
         hidden.decompose()
-    return _clean(copy.get_text(sep, strip=True))
+    return copy
+
+
+def _text(element: Tag | None) -> str:
+    return _clean(_visible_copy(element).get_text(" ", strip=True)) if element else ""
 
 
 def _multiline(element: Tag | None) -> str | None:
     if element is None:
         return None
-    copy = BeautifulSoup(str(element), "html.parser")
-    for hidden in copy.select(".accesshide, .sr-only, .visually-hidden, script, style"):
-        hidden.decompose()
-    lines = [_clean(line) for line in copy.get_text("\n", strip=True).splitlines()]
-    text = "\n".join(line for line in lines if line)
+    raw = _visible_copy(element).get_text("\n", strip=True)
+    text = "\n".join(line for line in (_clean(part) for part in raw.splitlines()) if line)
     return text or None
 
 
 def epoch_to_iso(value: int | str | None) -> str | None:
+    """Unix seconds -> naive JST ``YYYY-MM-DDTHH:MM`` (the DB's deadline format)."""
     if value in (None, "", 0, "0"):
         return None
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return None
     return (
-        datetime.fromtimestamp(int(value), UTC)
+        datetime.fromtimestamp(seconds, UTC)
         .astimezone(JST)
         .replace(tzinfo=None)
         .isoformat(timespec="minutes")
@@ -71,10 +86,11 @@ def epoch_to_iso(value: int | str | None) -> str | None:
 
 
 def course_code(fullname: str, idnumber: str | None = None) -> str | None:
-    match = re.search(r"\[([0-9][A-Z][0-9A-Z]{3,})\]", fullname or "")
+    """Kobe timetable codes are five characters, e.g. ``3X004``."""
+    match = re.search(r"\[([0-9][A-Z][0-9A-Z]{3})\]", fullname or "")
     if match:
         return match.group(1)
-    match = re.search(r"_([0-9][A-Z][0-9A-Z]{3,})$", idnumber or "")
+    match = re.search(r"_([0-9][A-Z][0-9A-Z]{3})$", idnumber or "")
     return match.group(1) if match else None
 
 
@@ -99,15 +115,8 @@ def parse_enrolled_course(raw: dict[str, Any], *, base_url: str) -> dict[str, An
         "course_code": course_code(fullname, raw.get("idnumber")),
         "term": course_term(fullname),
         "academic_year": int(year_match.group(1)) if year_match else None,
-        "visible": bool(raw.get("visible", True)),
-        "hidden": bool(raw.get("hidden", False)),
         "url": str(raw.get("viewurl") or f"{base_url}/course/view.php?id={raw['id']}"),
     }
-
-
-def _cmid(href: str) -> str | None:
-    values = parse_qs(urlparse(href).query).get("id")
-    return values[0] if values else None
 
 
 def pluginfile_links(html: str | Tag, *, base_url: str) -> list[dict[str, str]]:
@@ -115,123 +124,119 @@ def pluginfile_links(html: str | Tag, *, base_url: str) -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
     seen: set[str] = set()
     for tag in soup.select("a[href*='/pluginfile.php/']"):
-        url = urljoin(base_url + "/", str(tag["href"]).strip())
-        clean_url = url.split("?", 1)[0]
-        if clean_url in seen:
+        url = urljoin(base_url + "/", str(tag["href"]).strip()).split("?", 1)[0]
+        if url in seen:
             continue
-        seen.add(clean_url)
-        name = _text(tag) or clean_url.rsplit("/", 1)[-1]
-        out.append({"url": clean_url, "name": name})
+        seen.add(url)
+        out.append({"url": url, "name": _text(tag) or url.rsplit("/", 1)[-1]})
     return out
 
 
+def _nearest_section(li: Tag) -> Tag | None:
+    parent = li.parent
+    while parent is not None:
+        if isinstance(parent, Tag) and parent.name == "li" and parent.has_attr("data-number"):
+            if set(parent.get("class") or []) & {"section", "course-section"}:
+                return parent
+        parent = parent.parent
+    return None
+
+
 def parse_course_page(html: str, *, base_url: str) -> dict[str, Any]:
-    """Return ``{"summary", "sections", "activities"}`` from ``course/view.php``."""
+    """Return ``{"summary", "activities"}`` from ``course/view.php``.
+
+    Each activity is reported once, under its innermost section, so Moodle 4.5
+    subsections (sections nested inside a ``modtype_subsection`` activity) do
+    not duplicate their activities into the parent section.
+    """
     soup = BeautifulSoup(html or "", "html.parser")
-    sections: list[dict[str, Any]] = []
+    summary_parts = [
+        text
+        for section in soup.select(_SECTION_SELECTOR)
+        if section.get("data-number") == "0"
+        for text in [_multiline(section.select_one(".summarytext, .section-summary-text"))]
+        if text
+    ]
     activities: list[dict[str, Any]] = []
-    section_nodes = soup.select("li.section[data-sectionname], li.course-section[data-number]")
-    if not section_nodes:
-        section_nodes = [soup]  # flat fallback
-    summary_parts: list[str] = []
-    for node in section_nodes:
-        number = node.get("data-number") if isinstance(node, Tag) else None
-        name = _clean(node.get("data-sectionname")) if isinstance(node, Tag) else ""
-        summary_el = node.select_one(".summarytext, .section-summary-text")
-        section_summary = _multiline(summary_el)
-        if number in ("0", None) and section_summary:
-            summary_parts.append(section_summary)
-        sections.append(
+    seen: set[str] = set()
+    for li in soup.select("li.activity[data-id]"):
+        module_match = re.search(r"modtype_(\w+)", " ".join(li.get("class") or []))
+        cmid = str(li["data-id"])
+        if not module_match or cmid in seen:
+            continue
+        seen.add(cmid)
+        module = module_match.group(1)
+        if module == "subsection":
+            continue
+        section = _nearest_section(li)
+        number = section.get("data-number") if section is not None else None
+        section_name = _clean(section.get("data-sectionname")) if section is not None else ""
+        link = li.select_one(".activityname a[href], a.aalink[href]")
+        href = urljoin(base_url + "/", str(link["href"]).strip()) if link else None
+        named = li.select_one("[data-activityname]")
+        title = _text(li.select_one(".instancename")) or _clean(
+            str(named.get("data-activityname")) if named else ""
+        )
+        content_el = li.select_one(".activity-altcontent, .contentafterlink, .description")
+        body = _multiline(content_el)
+        if module == "label" and body:
+            # data-activityname is truncated with "..."; the first line is not.
+            title = body.split("\n", 1)[0][:80]
+        activities.append(
             {
-                "number": int(number) if number and str(number).isdigit() else None,
-                "name": name or None,
-                "summary": section_summary,
+                "cmid": cmid,
+                "module": module,
+                "title": title or f"{module} {cmid}",
+                "url": href,
+                "body": body,
+                "file_type": _text(li.select_one(".activitybadge")) or None,
+                "section_number": int(number) if number and str(number).isdigit() else None,
+                "section_name": section_name or None,
+                "inline_files": pluginfile_links(content_el, base_url=base_url)
+                if content_el
+                else [],
             }
         )
-        for li in node.select("li.activity[data-id]"):
-            classes = " ".join(li.get("class", []))
-            module_match = re.search(r"modtype_(\w+)", classes)
-            if not module_match:
-                continue
-            module = module_match.group(1)
-            cmid = str(li["data-id"])
-            link = li.select_one(".activityname a[href], a.aalink[href]")
-            href = urljoin(base_url + "/", str(link["href"]).strip()) if link else None
-            title_el = li.select_one(".instancename")
-            title = _text(title_el) or _clean(
-                li.select_one("[data-activityname]").get("data-activityname")
-                if li.select_one("[data-activityname]")
-                else ""
-            )
-            content_el = li.select_one(".activity-altcontent, .contentafterlink, .description")
-            body = _multiline(content_el)
-            badge = _text(li.select_one(".activitybadge"))
-            dates_text = _multiline(li.select_one("[data-region='activity-dates'], .activity-dates"))
-            if module == "label" and body:
-                # data-activityname is truncated with "..."; the first line is not.
-                title = body.split("\n", 1)[0][:80]
-            activities.append(
-                {
-                    "cmid": cmid,
-                    "module": module,
-                    "title": title or f"{module} {cmid}",
-                    "url": href,
-                    "body": body,
-                    "file_type": badge or None,
-                    "dates_text": dates_text,
-                    "section_number": int(number) if number and str(number).isdigit() else None,
-                    "section_name": name or None,
-                    "inline_files": pluginfile_links(content_el, base_url=base_url)
-                    if content_el
-                    else [],
-                    "restricted": bool(li.select_one(".availabilityinfo, [data-region='availabilityinfo']")),
-                }
-            )
-    return {
-        "summary": "\n".join(summary_parts) or None,
-        "sections": sections,
-        "activities": activities,
-    }
+    return {"summary": "\n".join(summary_parts) or None, "activities": activities}
 
 
-def parse_activity_page(html: str, *, module: str, base_url: str) -> dict[str, Any]:
-    """Body text, dates and files from a page/folder/assign view page."""
+def parse_activity_page(html: str, *, base_url: str) -> dict[str, Any]:
+    """Body text, dates, submission status and files from a page/folder/assign view."""
     soup = BeautifulSoup(html or "", "html.parser")
     main = soup.select_one("#region-main [role='main'], #region-main") or soup
-    for noisy in main.select(
-        ".activity-header .completion-info, .activity-navigation, form, "
-        "[data-region='activity-information'] .completion-info, .submissionlinks"
-    ):
+    for noisy in main.select(".completion-info, .activity-navigation, form, .submissionlinks"):
         noisy.decompose()
-    intro = main.select_one(".activity-description, #intro, .box.generalbox")
-    content = main.select_one(".box.generalbox.center, .page-content, #folder_tree0, .foldertree") or intro
+    intro = main.select_one(".activity-description, #intro")
+    content = main.select_one(".box.generalbox.center, .page-content, #folder_tree0, .foldertree")
     body_parts = [part for part in (_multiline(intro), _multiline(content)) if part]
-    body = "\n\n".join(dict.fromkeys(body_parts)) or None
     dates: dict[str, str] = {}
-    for row in main.select("[data-region='activity-dates'] div, .activity-dates div"):
-        match = re.match(r"\s*([^:：\d]+)[:：]\s*(.+)", _clean(row.get_text(" ", strip=True)))
+    for row in main.select("[data-region='activity-dates'] > div, .activity-dates > div"):
+        match = re.match(r"\s*([^:：\d]+?)\s*[:：]\s*(.+)", _clean(row.get_text(" ", strip=True)))
         if match:
             dates[match.group(1).strip()] = match.group(2).strip()
     status: dict[str, str] = {}
-    for tr in main.select(".submissionstatustable tr, table.generaltable tr"):
+    for tr in main.select("table.submissionstatustable tr"):
         th, td = tr.select_one("th"), tr.select_one("td")
         if th and td:
             status[_text(th)] = _text(td)
-    deadline = None
-    for label, value in list(dates.items()) + list(status.items()):
-        if re.search(r"期限|終了|Due|due", label):
-            deadline = parse_japanese_datetime(value) or deadline
-    submission = next(
-        (value for key, value in status.items() if re.search(r"提出ステータス|Submission status", key)),
+    deadline = next(
+        (
+            parsed
+            for label, value in dates.items()
+            if _DEADLINE_LABEL.match(label)
+            for parsed in [parse_japanese_datetime(value)]
+            if parsed
+        ),
         None,
     )
-    files = pluginfile_links(main, base_url=base_url)
     return {
-        "body": body,
+        "body": "\n\n".join(dict.fromkeys(body_parts)) or None,
         "deadline": deadline,
-        "submission_status": submission,
+        "submission_status": next(
+            (value for key, value in status.items() if _STATUS_LABEL.search(key)), None
+        ),
         "dates": dates or None,
-        "files": files,
+        "files": pluginfile_links(main, base_url=base_url),
     }
 
 
@@ -241,20 +246,31 @@ _JP_DT = re.compile(
 
 
 def parse_japanese_datetime(text: str | None) -> str | None:
+    """``2026年 10月 19日(月曜日) 23:59`` -> ``2026-10-19T23:59``; date-only -> ``2026-10-19``."""
     match = _JP_DT.search(text or "")
     if not match:
         return None
     year, month, day, hour, minute = match.groups()
-    value = datetime(int(year), int(month), int(day), int(hour or 0), int(minute or 0))
-    return value.isoformat(timespec="minutes")
+    if hour is None:
+        return datetime(int(year), int(month), int(day)).date().isoformat()
+    return datetime(int(year), int(month), int(day), int(hour), int(minute)).isoformat(
+        timespec="minutes"
+    )
 
 
-def parse_forum_discussions(html: str, *, base_url: str) -> list[dict[str, Any]]:
-    """Discussion rows from ``mod/forum/view.php`` (Moodle 4.x list view)."""
+def parse_forum_discussions(html: str, *, base_url: str) -> dict[str, Any]:
+    """Discussion rows from ``mod/forum/view.php`` (Moodle 4.x list view).
+
+    NOTE: the live BEEF forums had no posts when this was written, so these
+    selectors are not yet verified against real content.  ``paged`` is true
+    when the list continues on another page; the caller must then not treat
+    unseen discussions as deleted.
+    """
     soup = BeautifulSoup(html or "", "html.parser")
-    out: list[dict[str, Any]] = []
+    main = soup.select_one("#region-main") or soup
+    discussions: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for link in soup.select("a[href*='/mod/forum/discuss.php']"):
+    for link in main.select("a[href*='/mod/forum/discuss.php']"):
         href = urljoin(base_url + "/", str(link["href"]).strip())
         discussion_id = (parse_qs(urlparse(href).query).get("d") or [None])[0]
         if not discussion_id or discussion_id in seen:
@@ -263,30 +279,34 @@ def parse_forum_discussions(html: str, *, base_url: str) -> list[dict[str, Any]]
         if not title:
             continue
         seen.add(discussion_id)
-        row = link.find_parent("tr") or link.find_parent(attrs={"data-region": "discussion-list-item"})
-        published = None
-        if row is not None:
-            stamp = row.select_one("time[data-timestamp], [data-timestamp]")
-            if stamp is not None:
-                published = epoch_to_iso(stamp.get("data-timestamp"))
-        out.append(
+        row = link.find_parent("tr") or link.find_parent(
+            attrs={"data-region": "discussion-list-item"}
+        )
+        stamp = row.select_one("time[data-timestamp], [data-timestamp]") if row else None
+        discussions.append(
             {
                 "discussion_id": discussion_id,
                 "title": title,
                 "url": f"{base_url}/mod/forum/discuss.php?d={discussion_id}",
-                "published_at": published,
+                "published_at": epoch_to_iso(stamp.get("data-timestamp")) if stamp else None,
             }
         )
-    return out
+    paged = bool(
+        main.select_one("nav.pagination, ul.pagination, [data-region='pagination']")
+        or main.select_one("a[href*='/mod/forum/view.php'][href*='page=']")
+    )
+    return {"discussions": discussions, "paged": paged}
 
 
 def parse_forum_discussion(html: str, *, base_url: str) -> dict[str, Any]:
+    """First post of ``mod/forum/discuss.php`` (selectors not yet live-verified)."""
     soup = BeautifulSoup(html or "", "html.parser")
-    first = soup.select_one(
-        "[data-region-content='forum-post-core'], .post-content-container, .forumpost .content"
+    post = soup.select_one("[data-region='post'], .forumpost")
+    scope = post or soup
+    body_el = scope.select_one(
+        "[data-region-content='forum-post-core'], .post-content-container, .content"
     )
-    body = _multiline(first)
-    stamp = soup.select_one("[data-region='post'] time[datetime], .forumpost time[datetime]")
+    stamp = scope.select_one("time[datetime]")
     published = None
     if stamp is not None:
         try:
@@ -299,29 +319,36 @@ def parse_forum_discussion(html: str, *, base_url: str) -> dict[str, Any]:
         except ValueError:
             published = None
     return {
-        "body": body,
+        "body": _multiline(body_el),
         "published_at": published,
-        "files": pluginfile_links(first, base_url=base_url) if first else [],
+        "files": pluginfile_links(post, base_url=base_url) if post else [],
     }
 
 
 def calendar_deadlines(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Map course-module id -> {deadline, available_from} from calendar events."""
+    """Map course-module id -> {deadline, available_from} from calendar events.
+
+    ``due``/``close`` win over ``expectcompletionon`` regardless of order;
+    ``gradingdue`` and unknown event types never set a deadline.
+    """
     out: dict[str, dict[str, Any]] = {}
+    ranks: dict[str, int] = {}
     for event in events:
         url = str(event.get("url") or "")
-        cmid = _cmid(url) if "/mod/" in url else None
-        if not cmid:
+        if "/mod/" not in url:
             continue
-        entry = out.setdefault(cmid, {"course_moodle_id": (event.get("course") or {}).get("id")})
+        cmid = (parse_qs(urlparse(url).query).get("id") or [None])[0]
         when = epoch_to_iso(event.get("timestart"))
+        if not cmid or not when:
+            continue
         kind = str(event.get("eventtype") or "")
-        if kind in {"open", "allowsubmissionsfromdate"}:
-            entry["available_from"] = when
-        elif kind in {"due", "close", "expectcompletionon", "gradingdue"} or not entry.get("deadline"):
-            if kind == "gradingdue":
-                continue
-            entry["deadline"] = when
+        if kind in _OPEN_EVENTS:
+            out.setdefault(cmid, {})["available_from"] = when
+            continue
+        rank = _DEADLINE_EVENT_RANK.get(kind, 0)
+        if rank and rank >= ranks.get(cmid, 0):
+            out.setdefault(cmid, {})["deadline"] = when
+            ranks[cmid] = rank
     return out
 
 

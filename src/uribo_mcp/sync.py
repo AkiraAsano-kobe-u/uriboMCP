@@ -696,17 +696,17 @@ def _sync_venture(settings: Settings) -> dict[str, Any]:
 def _sync_moodle(
     settings: Settings, *, course_ids: list[str] | None = None
 ) -> dict[str, Any]:
-    from uribo_mcp.live import authenticated_moodle
+    from uribo_mcp.live import open_moodle
     from uribo_mcp.moodle.sync import MoodleSynchronizer
 
-    with authenticated_moodle(settings) as client:
-        with database(settings.paths.db_path) as conn:
-            return MoodleSynchronizer(
-                settings=settings,
-                repository=Repository(conn),
-                client=client,
-                pause=lambda: time.sleep(settings.sync.request_interval_seconds),
-            ).run(course_ids=course_ids)
+    client = open_moodle(settings)
+    with database(settings.paths.db_path) as conn:
+        return MoodleSynchronizer(
+            settings=settings,
+            repository=Repository(conn),
+            client=client,
+            pause=lambda: time.sleep(settings.sync.request_interval_seconds),
+        ).run(course_ids=course_ids)
 
 
 def _classification_keywords(conn) -> list[str]:
