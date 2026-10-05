@@ -309,6 +309,8 @@ def synchronize(
                 result = _sync_uribo(settings)
             elif source == "mail":
                 result = _sync_mail(settings)
+            elif source == "moodle":
+                result = _sync_moodle(settings, course_ids=course_ids)
             else:
                 raise ValueError(f"Unknown source: {source}")
             results[source] = {"status": "ok", **result}
@@ -689,6 +691,22 @@ def _sync_venture(settings: Settings) -> dict[str, Any]:
             ).sync_course(idnumber=VENTURE_IDNUMBER, source="venture")
             legacy.pop("seen_source_ids", None)
             return {**legacy, "courses": {VENTURE_IDNUMBER: course}}
+
+
+def _sync_moodle(
+    settings: Settings, *, course_ids: list[str] | None = None
+) -> dict[str, Any]:
+    from uribo_mcp.live import authenticated_moodle
+    from uribo_mcp.moodle.sync import MoodleSynchronizer
+
+    with authenticated_moodle(settings) as client:
+        with database(settings.paths.db_path) as conn:
+            return MoodleSynchronizer(
+                settings=settings,
+                repository=Repository(conn),
+                client=client,
+                pause=lambda: time.sleep(settings.sync.request_interval_seconds),
+            ).run(course_ids=course_ids)
 
 
 def _classification_keywords(conn) -> list[str]:

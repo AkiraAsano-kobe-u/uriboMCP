@@ -13,6 +13,7 @@ from .common import CATEGORY_LABELS, clean, is_actionable_open, parse_datetime
 
 SOURCE_META = {
     "beef": {"label": "BEEF+", "full": "LMS (BEEF+)", "mark": "oklch(0.72 0.115 212)"},
+    "moodle": {"label": "BEEF", "full": "LMS BEEF (Moodle)", "mark": "oklch(0.66 0.100 160)"},
     "venture": {"label": "venture", "full": "venture", "mark": "oklch(0.60 0.015 250)"},
     "csi": {"label": "学部", "full": "システム情報学部サイト", "mark": "oklch(0.55 0.020 250)"},
     "uribo": {"label": "うりぼー", "full": "教務システム", "mark": "oklch(0.70 0.020 250)"},

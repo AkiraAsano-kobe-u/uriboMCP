@@ -49,6 +49,7 @@ class SyncSettings:
         "venture",
         "uribo",
         "mail",
+        "moodle",
     )
     request_interval_seconds: float = 3.0
     source_interval_seconds: float = 5.0

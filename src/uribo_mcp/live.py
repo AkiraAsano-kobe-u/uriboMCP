@@ -16,6 +16,7 @@ from uribo_mcp.auth import CookieVault, load_credentials
 from uribo_mcp.config import Settings
 from uribo_mcp.course.client import BeefReadOnlyClient
 from uribo_mcp.errors import AuthenticationRequired
+from uribo_mcp.moodle.client import MoodleReadOnlyClient
 from uribo_mcp.subprocesses import hidden_selenium_service_kwargs
 
 
@@ -140,6 +141,71 @@ def authenticated_lms(
         yield driver, BeefReadOnlyClient(session, base_url=base_url)
     finally:
         driver.quit()
+
+
+@contextmanager
+def authenticated_moodle(
+    settings: Settings,
+    *,
+    base_url: str | None = None,
+    source: str = "moodle",
+) -> Iterator[MoodleReadOnlyClient]:
+    """Open LMS BEEF (Moodle) with saved cookies, else exactly one SSO login."""
+    from uribo_mcp.moodle.client import moodle_base_url
+
+    base_url = (base_url or moodle_base_url()).rstrip("/")
+    host = urlparse(base_url).hostname or ""
+    landing = f"{base_url}/my/courses.php"
+    vault = CookieVault(settings.paths.credentials_dir)
+
+    def signed_in(url: str) -> bool:
+        parsed = urlparse(url)
+        return (
+            parsed.hostname == host
+            and "/login/" not in parsed.path
+            and "/auth/shibboleth" not in parsed.path
+        )
+
+    cookies = vault.load(source)
+    if cookies:
+        client = MoodleReadOnlyClient(_requests_from_cookies(cookies), base_url=base_url)
+        try:
+            restored = bool(client.configure_sesskey(client.fetch_my_courses()))
+        except PermissionError:
+            restored = False
+        if restored:
+            # Yield outside the try so a caller's PermissionError propagates.
+            yield client
+            return
+    driver = make_chrome_driver()
+    try:
+        _inject_vault(driver, vault, source, f"https://{host}")
+        driver.get(landing)
+        if not signed_in(driver.current_url):
+            _login_once(driver, landing, host)
+            driver.get(landing)
+        if not signed_in(driver.current_url):
+            raise AuthenticationRequired(f"Could not open authenticated Moodle page: {landing}")
+        vault.save(source, driver.get_cookies())
+        session = _requests_from_driver(driver)
+    finally:
+        driver.quit()
+    client = MoodleReadOnlyClient(session, base_url=base_url)
+    client.fetch_my_courses()
+    yield client
+
+
+def _requests_from_cookies(cookies: list[dict]) -> requests.Session:
+    session = requests.Session()
+    for cookie in cookies:
+        session.cookies.set(
+            cookie["name"],
+            cookie["value"],
+            domain=cookie.get("domain"),
+            path=cookie.get("path", "/"),
+        )
+    session.headers.update({"Accept-Language": "ja,en;q=0.8"})
+    return session
 
 
 def fetch_uribo_html(settings: Settings) -> str:

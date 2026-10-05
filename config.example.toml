@@ -5,7 +5,7 @@ export_root = "exports"
 credentials_dir = "credentials"
 
 [sync]
-enabled_sources = ["csi", "pdf_calendar", "newsnet", "beef", "venture", "uribo", "mail"]
+enabled_sources = ["csi", "pdf_calendar", "newsnet", "beef", "venture", "uribo", "mail", "moodle"]
 request_interval_seconds = 3.0
 source_interval_seconds = 5.0
 job_stale_hours = 6
