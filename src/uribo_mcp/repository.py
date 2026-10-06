@@ -1088,7 +1088,17 @@ class Repository:
             if include_body:
                 summary["body"] = out.get("body")
             return summary
-        out["metadata"] = json.loads(out.pop("metadata_json") or "{}")
+        metadata = json.loads(out.pop("metadata_json") or "{}")
+        manifest = metadata.get("attachment_manifest") if isinstance(metadata, dict) else None
+        if isinstance(manifest, list):
+            # Download recipes are intentionally internal (see _public_attachment).
+            metadata["attachment_manifest"] = [
+                {key: value for key, value in entry.items() if key != "object_name"}
+                if isinstance(entry, dict)
+                else entry
+                for entry in manifest
+            ]
+        out["metadata"] = metadata
         out["is_read"] = bool(out["is_read"])
         out["is_done"] = bool(out["is_done"])
         out["available"] = bool(out["available"])

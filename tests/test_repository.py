@@ -135,3 +135,45 @@ def test_unchanged_upserts_do_not_write_to_database(tmp_path: Path) -> None:
         assert not repository.upsert_attachment(attachment_record).changed_fields
 
         assert connection.total_changes == changes_before
+
+
+def test_public_item_strips_object_name_from_attachment_manifest(tmp_path: Path) -> None:
+    with database(tmp_path / "data.db") as connection:
+        repository = Repository(connection)
+        course = repository.upsert_course(
+            CourseRecord(source="beef", idnumber="C1", course_name="線形代数")
+        )
+        item = repository.upsert_item(
+            ItemRecord(
+                source="beef",
+                source_id="material/C1/1",
+                category="material",
+                title="第1回資料",
+                course_id=course.id,
+                metadata={
+                    "attachment_manifest": [
+                        {
+                            "file_name": "notes.pdf",
+                            "object_name": "internal/download/recipe",
+                            "size_bytes": 10,
+                        },
+                        "not-a-dict",
+                    ],
+                    "other": {"object_name": "kept: only manifest entries are filtered"},
+                },
+            )
+        )
+        public = repository.get_item(item.id)
+        listed = repository.list_course_content(course.id, fields="full")
+        searched = repository.search_course_content("第1回", course_id=course.id)
+    assert public["metadata"]["attachment_manifest"] == [
+        {"file_name": "notes.pdf", "size_bytes": 10},
+        "not-a-dict",
+    ]
+    assert public["metadata"]["other"]["object_name"]
+    assert "object_name" not in listed[0]["metadata"]["attachment_manifest"][0]
+    assert "object_name" not in searched[0]["item"]["metadata"]["attachment_manifest"][0]
+    # The stored row is untouched; only the public view is filtered.
+    with database(tmp_path / "data.db", readonly=True) as connection:
+        raw = connection.execute("SELECT metadata_json FROM items WHERE id=?", (item.id,)).fetchone()
+    assert "internal/download/recipe" in raw[0]
