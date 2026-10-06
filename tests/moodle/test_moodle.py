@@ -888,3 +888,58 @@ def test_failed_sso_skips_later_sso_sources(tmp_path: Path, monkeypatch) -> None
     assert calls == ["beef", "csi"]
     assert results["moodle"]["status"] == "skipped"
     assert results["csi"]["status"] == "ok"
+
+
+def test_open_moodle_waits_for_shibboleth_chain_before_login(tmp_path: Path, monkeypatch) -> None:
+    """Live failure 2026-10-06: get() returned mid-chain on the Moodle host,
+    the old login helper saw the Moodle host and skipped the form."""
+    from uribo_mcp import live
+    from uribo_mcp.errors import AuthenticationRequired
+
+    settings = load_settings(root=tmp_path)
+    monkeypatch.setattr(live, "_requests_from_driver", lambda driver: _Session())
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+
+    class ChainDriver(_FakeDriver):
+        def __init__(self):
+            super().__init__()
+            self.steps = []
+
+        def get(self, url):
+            if self.logged_in:
+                self.current_url = url
+            elif "favicon" in url:
+                self.current_url = url
+            else:  # mid-chain first, KNOSSOS on the next poll
+                self.steps = ["https://beef.center.kobe-u.ac.jp/Shibboleth.sso/SAML2/POST",
+                              "https://knossos.center.kobe-u.ac.jp/auth"]
+                self.current_url = self.steps.pop(0)
+
+        def __getattribute__(self, name):
+            if name == "current_url":
+                steps = object.__getattribute__(self, "__dict__").get("steps")
+                value = object.__getattribute__(self, "__dict__")["current_url"]
+                if steps:
+                    object.__getattribute__(self, "__dict__")["current_url"] = steps.pop(0)
+                return value
+            return object.__getattribute__(self, name)
+
+    logins = []
+
+    def login(driver, url, host):
+        assert "knossos" in driver.current_url, "form must be submitted on the KNOSSOS page"
+        logins.append(url)
+        driver.logged_in = True
+        driver.current_url = url
+
+    client = live.open_moodle(settings, base_url=BASE, driver_factory=ChainDriver, login=login)
+    assert len(logins) == 1 and client.has_session_key
+
+    class StuckDriver(_FakeDriver):
+        def get(self, url):
+            self.current_url = "https://idp.center.kobe-u.ac.jp/idp/error"
+
+    monkeypatch.setattr("time.monotonic", iter(range(0, 1000, 30)).__next__)
+    with pytest.raises(AuthenticationRequired):
+        live.open_moodle(settings, base_url=BASE, driver_factory=StuckDriver, login=login)
+    assert len(logins) == 1  # never submitted when KNOSSOS was not reached

@@ -101,6 +101,7 @@ class MoodleReadOnlyClient:
             parsed.netloc != self._host
             or "/login/" in parsed.path
             or "/auth/shibboleth" in parsed.path
+            or "/Shibboleth.sso" in parsed.path
         )
 
     def _assert_allowed(self, url: str, params: dict | None = None) -> None:
