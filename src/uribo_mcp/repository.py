@@ -233,9 +233,17 @@ class Repository:
         seen_source_ids: Iterable[str],
         course_id: int | None = None,
         categories: Sequence[str] | None = None,
+        source_id_prefixes: Sequence[str] | None = None,
     ) -> int:
-        """Mark unseen rows unavailable only after a successful complete snapshot."""
+        """Mark unseen rows unavailable only after a successful complete snapshot.
+
+        ``source_id_prefixes`` narrows the snapshot to rows whose ``source_id``
+        starts with one of the prefixes (plain string match, no LIKE wildcards),
+        so one remote container cannot hide rows owned by another container that
+        shares the same local ``course_id``.
+        """
         seen = set(seen_source_ids)
+        prefixes = tuple(source_id_prefixes or ())
         where = ["source=?", "available=1"]
         params: list[Any] = [source]
         if course_id is not None:
@@ -251,6 +259,8 @@ class Repository:
         now = utc_now()
         for row in rows:
             if row["source_id"] in seen:
+                continue
+            if prefixes and not str(row["source_id"]).startswith(prefixes):
                 continue
             self.conn.execute(
                 "UPDATE items SET available=0, updated_at=? WHERE id=?",
@@ -331,17 +341,28 @@ class Repository:
         )
 
     def mark_attachments_missing(
-        self, *, item_id: int, seen_stable_keys: Iterable[str]
+        self,
+        *,
+        item_id: int,
+        seen_stable_keys: Iterable[str],
+        course_id: int | None = None,
     ) -> int:
+        """Hide unseen attachments of an item.
+
+        With ``course_id`` given, rows of the item stored under another course
+        (left behind when the item moved between courses) are hidden as well,
+        so the same file is not searchable twice.
+        """
         seen = set(seen_stable_keys)
         rows = self.conn.execute(
-            "SELECT id,stable_key FROM attachments WHERE item_id=? AND available=1",
+            "SELECT id,stable_key,course_id FROM attachments WHERE item_id=? AND available=1",
             (item_id,),
         ).fetchall()
         changed = 0
         now = utc_now()
         for row in rows:
-            if row["stable_key"] in seen:
+            moved = course_id is not None and row["course_id"] != course_id
+            if row["stable_key"] in seen and not moved:
                 continue
             self.conn.execute(
                 "UPDATE attachments SET available=0,updated_at=? WHERE id=?",
@@ -478,18 +499,32 @@ class Repository:
             row = self.conn.execute("SELECT * FROM courses WHERE id=?", (int(query),)).fetchone()
             return self._public_course(row) if row else None
         exact = self.conn.execute(
-            "SELECT * FROM courses WHERE idnumber=? OR course_name=? ORDER BY available DESC LIMIT 1",
+            "SELECT * FROM courses WHERE idnumber=? OR course_name=? "
+            "ORDER BY available DESC, (source='moodle') ASC, id LIMIT 1",
             (str(query), str(query)),
         ).fetchone()
         if exact:
-            return self._public_course(exact)
+            return self._linked_course(exact)
         needle = normalize_search(str(query))
         for row in self.conn.execute(
-            "SELECT * FROM courses ORDER BY available DESC, academic_year DESC"
+            "SELECT * FROM courses ORDER BY available DESC, (source='moodle') ASC, "
+            "academic_year DESC, id"
         ):
             if needle in normalize_search(f"{row['course_code'] or ''} {row['course_name']}"):
-                return self._public_course(row)
+                return self._linked_course(row)
         return None
+
+    def _linked_course(self, row: sqlite3.Row) -> dict[str, Any]:
+        """A Moodle anchor row linked to BEEF+ resolves to the row holding its items."""
+        course = self._public_course(row)
+        linked = (course.get("metadata") or {}).get("linked_beef_course_id")
+        if row["source"] == "moodle" and linked:
+            target = self.conn.execute(
+                "SELECT * FROM courses WHERE id=? AND available=1", (int(linked),)
+            ).fetchone()
+            if target:
+                return self._public_course(target)
+        return course
 
     def list_course_content(
         self,

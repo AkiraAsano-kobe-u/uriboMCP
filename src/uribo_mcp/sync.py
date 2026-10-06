@@ -18,12 +18,17 @@ from filelock import FileLock, Timeout
 
 from uribo_mcp.config import ENV_CONFIG, Settings, load_settings
 from uribo_mcp.db import database
+from uribo_mcp.errors import AuthenticationRequired
 from uribo_mcp.ingest import CourseIngestor, ingest_items
 from uribo_mcp.legacy import classifier, dedup, inference
 from uribo_mcp.repository import Repository, utc_now
 from uribo_mcp.subprocesses import hidden_process_kwargs
 
 LOGGER = logging.getLogger(__name__)
+# Sources that sign in through KNOSSOS.  After one of them reports
+# AuthenticationRequired, later ones in the same run are skipped so a wrong
+# password costs one form submission per run, not one per source.
+SSO_SOURCES = frozenset({"beef", "venture", "uribo", "moodle"})
 TIMETABLE_FIELDS = (
     "day_of_week",
     "period",
@@ -289,11 +294,21 @@ def synchronize(
         if scope == "all"
         else ["beef"] if scope == "courses" else [scope]
     )
+    # The frequent "beef" schedule covers both LMSs once Moodle is enabled, so
+    # course material and deadlines from LMS BEEF (Moodle) stay as fresh as BEEF+.
+    if scope == "beef" and "moodle" in settings.sync.enabled_sources:
+        requested.append("moodle")
     if scope == "all" and "beef" not in requested:
         requested.append("beef")
     results: dict[str, Any] = {}
+    sso_blocked: str | None = None
     for index, source in enumerate(requested):
         progress(index / max(len(requested), 1), f"syncing {source}")
+        if sso_blocked and source in SSO_SOURCES:
+            reason = f"skipped: KNOSSOS sign-in failed earlier in this run ({sso_blocked})"
+            results[source] = {"status": "skipped", "error": reason}
+            _log_source(settings, source, "error", {}, reason)
+            continue
         try:
             if source == "beef":
                 result = _sync_beef(settings, course_ids=course_ids)
@@ -309,11 +324,15 @@ def synchronize(
                 result = _sync_uribo(settings)
             elif source == "mail":
                 result = _sync_mail(settings)
+            elif source == "moodle":
+                result = _sync_moodle(settings, course_ids=course_ids)
             else:
                 raise ValueError(f"Unknown source: {source}")
             results[source] = {"status": "ok", **result}
             _log_source(settings, source, "ok", result)
         except Exception as exc:
+            if isinstance(exc, AuthenticationRequired) and source in SSO_SOURCES:
+                sso_blocked = source
             LOGGER.exception("source %s failed", source)
             results[source] = {
                 "status": "error",
@@ -689,6 +708,22 @@ def _sync_venture(settings: Settings) -> dict[str, Any]:
             ).sync_course(idnumber=VENTURE_IDNUMBER, source="venture")
             legacy.pop("seen_source_ids", None)
             return {**legacy, "courses": {VENTURE_IDNUMBER: course}}
+
+
+def _sync_moodle(
+    settings: Settings, *, course_ids: list[str] | None = None
+) -> dict[str, Any]:
+    from uribo_mcp.live import open_moodle
+    from uribo_mcp.moodle.sync import MoodleSynchronizer
+
+    client = open_moodle(settings)
+    with database(settings.paths.db_path) as conn:
+        return MoodleSynchronizer(
+            settings=settings,
+            repository=Repository(conn),
+            client=client,
+            pause=lambda: time.sleep(settings.sync.request_interval_seconds),
+        ).run(course_ids=course_ids)
 
 
 def _classification_keywords(conn) -> list[str]:

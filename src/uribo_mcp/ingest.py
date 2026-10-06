@@ -6,11 +6,11 @@ import logging
 import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from urllib.parse import parse_qs, urlparse
 
 from uribo_mcp.config import Settings
-from uribo_mcp.course.client import BeefReadOnlyClient
+from uribo_mcp.course.client import BeefReadOnlyClient, DownloadedFile
 from uribo_mcp.course.parser import (
     parse_announcement_detail,
     parse_assignment_detail,
@@ -87,6 +87,215 @@ def _idnumber_from_item(item: dict[str, Any]) -> str | None:
     return (query.get("idnumber") or [None])[0]
 
 
+class AttachmentDownloader(Protocol):
+    def download_attachment(
+        self,
+        attachment: dict[str, Any],
+        *,
+        destination_dir: Path,
+        max_bytes: int = ...,
+    ) -> DownloadedFile: ...
+
+
+class AttachmentIngestor:
+    """Download, cache and extract attachments for any read-only LMS client."""
+
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        repository: Repository,
+        downloader: AttachmentDownloader,
+        pause: Callable[[], None],
+    ) -> None:
+        self.settings = settings
+        self.repository = repository
+        self.downloader = downloader
+        self.pause = pause
+
+    def sync_item_attachments(
+        self,
+        *,
+        item_id: int,
+        course_id: int,
+        idnumber: str,
+        attachments: list[dict[str, Any]],
+    ) -> dict[str, int]:
+        counts = {"downloaded": 0, "reused": 0, "failed": 0, "unavailable": 0}
+        seen = []
+        for attachment in attachments:
+            seen.append(str(attachment["stable_id"]))
+            try:
+                outcome = self._sync_attachment(
+                    attachment,
+                    item_id=item_id,
+                    course_id=course_id,
+                    idnumber=idnumber,
+                )
+                counts[outcome] += 1
+                if outcome == "downloaded":
+                    self.pause()
+            except Exception as exc:  # Continue other course material.
+                LOGGER.warning(
+                    "attachment sync failed for %s: %s",
+                    attachment.get("name"),
+                    exc,
+                )
+                counts["failed"] += 1
+                self.pause()
+        counts["unavailable"] = self.repository.mark_attachments_missing(
+            item_id=item_id,
+            seen_stable_keys=seen,
+            course_id=course_id,
+        )
+        return counts
+
+    def _sync_attachment(
+        self,
+        attachment: dict[str, Any],
+        *,
+        item_id: int,
+        course_id: int,
+        idnumber: str,
+    ) -> AttachmentSyncOutcome:
+        scan_status = str(attachment.get("scan_status") or "").casefold()
+        if scan_status in {"infected", "unsafe", "ng", "blocked", "error"}:
+            LOGGER.warning("blocked unsafe attachment: %s", attachment.get("name"))
+            return "failed"
+        metadata = {**(attachment.get("metadata") or {}), "idnumber": idnumber}
+        record = AttachmentRecord(
+            stable_key=str(attachment["stable_id"]),
+            file_name=str(attachment["name"]),
+            display_name=str(attachment["name"]),
+            item_id=item_id,
+            course_id=course_id,
+            content_id=attachment.get("content_id"),
+            resource_id=attachment.get("resource_id"),
+            mime_type=attachment.get("mime_type"),
+            source_url=attachment.get("url"),
+            object_name=attachment.get("object_name"),
+            scan_status=attachment.get("scan_status"),
+            open_end_at=attachment.get("open_end_at"),
+            metadata=metadata,
+        )
+        saved = self.repository.upsert_attachment(record)
+        row = self.repository.conn.execute(
+            "SELECT * FROM attachments WHERE id=?", (saved.id,)
+        ).fetchone()
+        cached_path = self._cached_attachment_path(
+            row,
+            changed_fields=saved.changed_fields,
+        )
+        if cached_path is not None:
+            return "reused"
+        previous_sha = row["sha256"] if row else None
+        target_dir = (
+            self.settings.paths.cache_dir
+            / "attachments"
+            / str(course_id)
+            / str(saved.id)
+        )
+        try:
+            downloaded = self.downloader.download_attachment(
+                {**attachment, "metadata": metadata},
+                destination_dir=target_dir,
+                max_bytes=self.settings.documents.max_file_bytes,
+            )
+            limits = DocumentLimits(
+                max_bytes=self.settings.documents.max_file_bytes,
+                max_pages=self.settings.documents.max_pdf_pages,
+                chunk_chars=self.settings.documents.chunk_chars,
+                chunk_overlap_chars=self.settings.documents.chunk_overlap_chars,
+                ocr_min_native_chars=self.settings.documents.ocr_min_chars_per_page,
+            )
+            ocr = (
+                TesseractCliBackend(
+                    self.settings.documents.tesseract_command,
+                    default_language=self.settings.documents.ocr_languages,
+                )
+                if self.settings.features.ocr
+                else None
+            )
+            result = extract_document(downloaded.path, limits=limits, ocr_backend=ocr)
+            if (
+                previous_sha
+                and previous_sha == result.sha256
+                and row
+                and row["extract_status"] == "ok"
+            ):
+                return "downloaded"
+            pages = [
+                {
+                    "page_number": page.number,
+                    "text": page.text,
+                    "extraction_method": page.source,
+                }
+                for page in result.pages
+            ]
+            chunks = [
+                {
+                    "chunk_index": chunk.index,
+                    "page_start": chunk.page_start,
+                    "page_end": chunk.page_end,
+                    "text": chunk.text,
+                }
+                for chunk in result.chunks
+            ]
+            methods = sorted({page.source for page in result.pages})
+            self.repository.replace_document_text(
+                saved.id,
+                pages,
+                chunks,
+                status=result.status,
+                method="+".join(methods) or None,
+                sha256=result.sha256,
+                size_bytes=downloaded.size_bytes,
+                local_path=str(downloaded.path),
+                error_message=result.error,
+            )
+            return (
+                "downloaded"
+                if result.status in {"ok", "unsupported", "password_required"}
+                else "failed"
+            )
+        except Exception as exc:
+            self.repository.replace_document_text(
+                saved.id,
+                [],
+                [],
+                status="error",
+                method=None,
+                error_message=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+
+    @staticmethod
+    def _cached_attachment_path(
+        row: Any,
+        *,
+        changed_fields: tuple[str, ...],
+    ) -> Path | None:
+        if row is None or not row["local_path"] or not row["sha256"]:
+            return None
+        changed = set(changed_fields)
+        if "object_name" in changed:
+            return None
+        if not row["object_name"] and changed.intersection(
+            {"resource_id", "content_id", "source_url", "file_name"}
+        ):
+            return None
+        path = Path(str(row["local_path"]))
+        try:
+            if not path.is_file():
+                return None
+            expected_size = row["size_bytes"]
+            if expected_size is not None and path.stat().st_size != int(expected_size):
+                return None
+        except OSError:
+            return None
+        return path
+
+
 class CourseIngestor:
     """Synchronize course pages without invoking test/survey/attendance actions."""
 
@@ -103,6 +312,12 @@ class CourseIngestor:
         self.client = client
         self.pause = pause or (
             lambda: time.sleep(self.settings.sync.request_interval_seconds)
+        )
+        self.attachments = AttachmentIngestor(
+            settings=settings,
+            repository=repository,
+            downloader=client,
+            pause=self.pause,
         )
 
     def sync_course(
@@ -228,33 +443,12 @@ class CourseIngestor:
         idnumber: str,
         attachments: list[dict[str, Any]],
     ) -> dict[str, int]:
-        counts = {"downloaded": 0, "reused": 0, "failed": 0, "unavailable": 0}
-        seen = []
-        for attachment in attachments:
-            seen.append(str(attachment["stable_id"]))
-            try:
-                outcome = self._sync_attachment(
-                    attachment,
-                    item_id=item_id,
-                    course_id=course_id,
-                    idnumber=idnumber,
-                )
-                counts[outcome] += 1
-                if outcome == "downloaded":
-                    self.pause()
-            except Exception as exc:  # Continue other course material.
-                LOGGER.warning(
-                    "attachment sync failed for %s: %s",
-                    attachment.get("name"),
-                    exc,
-                )
-                counts["failed"] += 1
-                self.pause()
-        counts["unavailable"] = self.repository.mark_attachments_missing(
+        return self.attachments.sync_item_attachments(
             item_id=item_id,
-            seen_stable_keys=seen,
+            course_id=course_id,
+            idnumber=idnumber,
+            attachments=attachments,
         )
-        return counts
 
     def _with_detail(self, content: dict[str, Any], *, idnumber: str) -> dict[str, Any]:
         url = str(content.get("url") or "")
@@ -310,150 +504,5 @@ class CourseIngestor:
         result["attachments"] = list(combined.values())
         return result
 
-    def _sync_attachment(
-        self,
-        attachment: dict[str, Any],
-        *,
-        item_id: int,
-        course_id: int,
-        idnumber: str,
-    ) -> AttachmentSyncOutcome:
-        scan_status = str(attachment.get("scan_status") or "").casefold()
-        if scan_status in {"infected", "unsafe", "ng", "blocked", "error"}:
-            LOGGER.warning("blocked unsafe attachment: %s", attachment.get("name"))
-            return "failed"
-        metadata = {**(attachment.get("metadata") or {}), "idnumber": idnumber}
-        record = AttachmentRecord(
-            stable_key=str(attachment["stable_id"]),
-            file_name=str(attachment["name"]),
-            display_name=str(attachment["name"]),
-            item_id=item_id,
-            course_id=course_id,
-            content_id=attachment.get("content_id"),
-            resource_id=attachment.get("resource_id"),
-            mime_type=attachment.get("mime_type"),
-            source_url=attachment.get("url"),
-            object_name=attachment.get("object_name"),
-            scan_status=attachment.get("scan_status"),
-            open_end_at=attachment.get("open_end_at"),
-            metadata=metadata,
-        )
-        saved = self.repository.upsert_attachment(record)
-        row = self.repository.conn.execute(
-            "SELECT * FROM attachments WHERE id=?", (saved.id,)
-        ).fetchone()
-        cached_path = self._cached_attachment_path(
-            row,
-            changed_fields=saved.changed_fields,
-        )
-        if cached_path is not None:
-            return "reused"
-        previous_sha = row["sha256"] if row else None
-        target_dir = (
-            self.settings.paths.cache_dir
-            / "attachments"
-            / str(course_id)
-            / str(saved.id)
-        )
-        try:
-            downloaded = self.client.download_attachment(
-                {**attachment, "metadata": metadata},
-                destination_dir=target_dir,
-                max_bytes=self.settings.documents.max_file_bytes,
-            )
-            limits = DocumentLimits(
-                max_bytes=self.settings.documents.max_file_bytes,
-                max_pages=self.settings.documents.max_pdf_pages,
-                chunk_chars=self.settings.documents.chunk_chars,
-                chunk_overlap_chars=self.settings.documents.chunk_overlap_chars,
-                ocr_min_native_chars=self.settings.documents.ocr_min_chars_per_page,
-            )
-            ocr = (
-                TesseractCliBackend(
-                    self.settings.documents.tesseract_command,
-                    default_language=self.settings.documents.ocr_languages,
-                )
-                if self.settings.features.ocr
-                else None
-            )
-            result = extract_document(downloaded.path, limits=limits, ocr_backend=ocr)
-            if (
-                previous_sha
-                and previous_sha == result.sha256
-                and row
-                and row["extract_status"] == "ok"
-            ):
-                return "downloaded"
-            pages = [
-                {
-                    "page_number": page.number,
-                    "text": page.text,
-                    "extraction_method": page.source,
-                }
-                for page in result.pages
-            ]
-            chunks = [
-                {
-                    "chunk_index": chunk.index,
-                    "page_start": chunk.page_start,
-                    "page_end": chunk.page_end,
-                    "text": chunk.text,
-                }
-                for chunk in result.chunks
-            ]
-            methods = sorted({page.source for page in result.pages})
-            self.repository.replace_document_text(
-                saved.id,
-                pages,
-                chunks,
-                status=result.status,
-                method="+".join(methods) or None,
-                sha256=result.sha256,
-                size_bytes=downloaded.size_bytes,
-                local_path=str(downloaded.path),
-                error_message=result.error,
-            )
-            return (
-                "downloaded"
-                if result.status in {"ok", "unsupported", "password_required"}
-                else "failed"
-            )
-        except Exception as exc:
-            self.repository.replace_document_text(
-                saved.id,
-                [],
-                [],
-                status="error",
-                method=None,
-                error_message=f"{type(exc).__name__}: {exc}",
-            )
-            raise
 
-    @staticmethod
-    def _cached_attachment_path(
-        row: Any,
-        *,
-        changed_fields: tuple[str, ...],
-    ) -> Path | None:
-        if row is None or not row["local_path"] or not row["sha256"]:
-            return None
-        changed = set(changed_fields)
-        if "object_name" in changed:
-            return None
-        if not row["object_name"] and changed.intersection(
-            {"resource_id", "content_id", "source_url", "file_name"}
-        ):
-            return None
-        path = Path(str(row["local_path"]))
-        try:
-            if not path.is_file():
-                return None
-            expected_size = row["size_bytes"]
-            if expected_size is not None and path.stat().st_size != int(expected_size):
-                return None
-        except OSError:
-            return None
-        return path
-
-
-__all__ = ["CourseIngestor", "ingest_items"]
+__all__ = ["AttachmentDownloader", "AttachmentIngestor", "CourseIngestor", "ingest_items"]

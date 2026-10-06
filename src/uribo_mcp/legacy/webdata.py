@@ -13,6 +13,7 @@ from .common import CATEGORY_LABELS, clean, is_actionable_open, parse_datetime
 
 SOURCE_META = {
     "beef": {"label": "BEEF+", "full": "LMS (BEEF+)", "mark": "oklch(0.72 0.115 212)"},
+    "moodle": {"label": "BEEF", "full": "LMS BEEF (Moodle)", "mark": "oklch(0.66 0.100 160)"},
     "venture": {"label": "venture", "full": "venture", "mark": "oklch(0.60 0.015 250)"},
     "csi": {"label": "学部", "full": "システム情報学部サイト", "mark": "oklch(0.55 0.020 250)"},
     "uribo": {"label": "うりぼー", "full": "教務システム", "mark": "oklch(0.70 0.020 250)"},
@@ -142,6 +143,7 @@ def get_course_related(conn, course_names: list[str], *, announcement_limit: int
     open_items.sort(key=lambda x: x["deadline"] or "")
     announcements = [map_item(r) for r in rows if r["category"] in {"announcement", "event", "material"}][:announcement_limit]
     links = [{"course_name": r["course_name"], "url": f"https://beefplus.center.kobe-u.ac.jp/lms/course?idnumber={r['idnumber']}"} for r in conn.execute("SELECT DISTINCT course_name,idnumber FROM timetable WHERE idnumber IS NOT NULL") if _normalize_course(r["course_name"]) in names]
+    links += [{"course_name": r["course_name"], "url": r["source_url"], "lms": "BEEF (Moodle)"} for r in conn.execute("SELECT course_name,source_url FROM courses WHERE source='moodle' AND available=1 AND source_url IS NOT NULL") if _normalize_course(r["course_name"]) in names]
     return {"open_actionable": open_items, "announcements": announcements, "notes": get_course_notes(conn, course_names), "course_links": links, "total": len(open_items) + len(announcements)}
 
 

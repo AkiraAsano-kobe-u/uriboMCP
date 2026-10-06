@@ -5,6 +5,8 @@ export_root = "exports"
 credentials_dir = "credentials"
 
 [sync]
+# Add "moodle" to also sync LMS BEEF (Moodle, beef.center.kobe-u.ac.jp).
+# It is opt-in because it needs its own KNOSSOS sign-in when cookies expire.
 enabled_sources = ["csi", "pdf_calendar", "newsnet", "beef", "venture", "uribo", "mail"]
 request_interval_seconds = 3.0
 source_interval_seconds = 5.0
