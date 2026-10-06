@@ -607,8 +607,15 @@ class Repository:
                     }
                 )
 
-        doc_where = ["a.available=1"]
-        doc_params: list[Any] = []
+        # search_text is normalize_search()'d at write time and the query at read
+        # time, so SQL instr() substring matching is exactly the Python `in` test.
+        # Candidates are pre-filtered with OR in SQL; the AND decision and the
+        # score stay in Python on the (small) candidate set.
+        doc_where = [
+            "a.available=1",
+            "(" + " OR ".join("instr(dc.search_text, ?)>0" for _ in tokens) + ")",
+        ]
+        doc_params: list[Any] = [*tokens]
         if course_id is not None:
             doc_where.append("a.course_id=?")
             doc_params.append(course_id)
