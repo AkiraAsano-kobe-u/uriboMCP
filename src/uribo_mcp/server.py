@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 
 from uribo_mcp.config import Settings, load_settings
 from uribo_mcp.db import database
@@ -339,10 +339,19 @@ def build_server(settings: Settings | None = None):
         }
 
     @server.tool(annotations=read_only)
-    def list_courses(available_only: bool = True) -> dict[str, Any]:
-        """同期済みの授業一覧を返す。"""
+    def list_courses(
+        available_only: bool = True, fields: Literal["summary", "full"] = "summary"
+    ) -> dict[str, Any]:
+        """同期済みの授業一覧を返す。
+
+        fields="summary"（既定）は id/source/idnumber/course_code/course_name/
+        academic_year/term/schedule_text/available のみ。instructors・summary・
+        metadata 等が必要なら fields="full"。
+        """
         with database(settings.paths.db_path, readonly=True) as conn:
-            courses = Repository(conn).list_courses(available_only=available_only)
+            courses = Repository(conn).list_courses(
+                available_only=available_only, fields=fields
+            )
         return {"count": len(courses), "courses": courses}
 
     @server.tool(annotations=read_only)
@@ -351,8 +360,15 @@ def build_server(settings: Settings | None = None):
         kinds: list[str] | None = None,
         available_only: bool = True,
         limit: int = 100,
+        fields: Literal["summary", "full"] = "summary",
     ) -> dict[str, Any]:
-        """授業内の教材・お知らせ・課題・テスト等のメタデータ一覧を返す。"""
+        """授業内の教材・お知らせ・課題・テスト等のメタデータ一覧を返す。
+
+        fields="summary"（既定）は id/source/category/title/url/course_name/
+        course_id/published_at/deadline/is_done/available/updated_at/
+        attachment_count のみ。metadata・content_hash・各種タイムスタンプが必要なら
+        fields="full" か get_course_content(item_id)。
+        """
         with database(settings.paths.db_path, readonly=True) as conn:
             repository = Repository(conn)
             resolved = _resolve_course(repository, course)
@@ -363,6 +379,7 @@ def build_server(settings: Settings | None = None):
                 kinds=kinds,
                 available_only=available_only,
                 limit=_limit(settings, limit),
+                fields=fields,
             )
         return {**resolved, "count": len(items), "items": items}
 
@@ -379,6 +396,7 @@ def build_server(settings: Settings | None = None):
         course: str | None = None,
         kinds: list[str] | None = None,
         limit: int = 20,
+        include_text: bool = False,
     ) -> dict[str, Any]:
         """授業本文と抽出済みPDF／Office文書を横断検索する。
 
@@ -386,6 +404,10 @@ def build_server(settings: Settings | None = None):
         0件のときは語ごとの一致に自動で切り替え（match_mode="any"）、一致語数→
         スコア順で返す。各結果の tokens_matched と tokens_unmatched（どの資料にも
         無い語）を見て、語を削って再検索する前に判断すること。
+
+        文書結果は既定で snippet（一致語を中心に約300文字）と text_chars のみを
+        返す。全文が必要なら include_text=true か、attachment_id と
+        page_start/page_end を read_document に渡す。
         """
         with database(settings.paths.db_path, readonly=True) as conn:
             repository = Repository(conn)
@@ -401,6 +423,7 @@ def build_server(settings: Settings | None = None):
                 course_id=course_id,
                 kinds=kinds,
                 limit=_limit(settings, limit),
+                include_text=include_text,
             )
         results = search["results"]
         return {

@@ -32,6 +32,35 @@ TRACKED_ITEM_FIELDS = (
 
 NOTIFICATION_CATEGORIES = {"material", "announcement", "assignment", "test", "survey"}
 
+FIELD_SETS = ("summary", "full")
+ITEM_SUMMARY_FIELDS = (
+    "id",
+    "source",
+    "category",
+    "title",
+    "url",
+    "course_name",
+    "course_id",
+    "published_at",
+    "deadline",
+    "is_done",
+    "available",
+    "updated_at",
+    "attachment_count",
+)
+COURSE_SUMMARY_FIELDS = (
+    "id",
+    "source",
+    "idnumber",
+    "course_code",
+    "course_name",
+    "academic_year",
+    "term",
+    "schedule_text",
+    "available",
+)
+DEFAULT_SNIPPET_CHARS = 300
+
 
 def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
@@ -54,6 +83,51 @@ def normalize_search(text: str | None) -> str:
 
 def _row_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
+
+
+def _check_fields(fields: str) -> str:
+    if fields not in FIELD_SETS:
+        raise ValueError(f"fields must be one of {FIELD_SETS}, got {fields!r}")
+    return fields
+
+
+def _first_match_offset(text: str, tokens: Sequence[str]) -> int:
+    """Locate the earliest normalized token in the original text.
+
+    Normalize the whole string, not individual characters: NFKC composes kana
+    voicing marks, combining accents and Hangul Jamo across character boundaries.
+    Normalized prefix lengths then map the match back to an original offset.
+    """
+    haystack = normalize_search(text)
+    positions = [haystack.find(token) for token in tokens]
+    found = [position for position in positions if position >= 0]
+    if not found:
+        return 0
+    first = min(found)
+    low, high = 1, len(text)
+    while low < high:
+        middle = (low + high) // 2
+        if len(normalize_search(text[:middle])) > first:
+            high = middle
+        else:
+            low = middle + 1
+    return low - 1
+
+
+def make_snippet(text: str, tokens: Sequence[str], *, snippet_chars: int) -> str:
+    """Window of ``snippet_chars`` characters centred on the first matched token."""
+    if len(text) <= snippet_chars:
+        return text
+    centre = _first_match_offset(text, tokens)
+    start = max(0, centre - snippet_chars // 2)
+    end = min(len(text), start + snippet_chars)
+    start = max(0, end - snippet_chars)
+    window = text[start:end]
+    if start > 0:
+        window = "…" + window
+    if end < len(text):
+        window = window + "…"
+    return window
 
 
 def _notification_kind(category: str, created: bool, changed: Sequence[str]) -> str | None:
@@ -487,12 +561,15 @@ class Repository:
 
     # ------------------------------------------------------------------- reads
 
-    def list_courses(self, *, available_only: bool = True) -> list[dict[str, Any]]:
+    def list_courses(
+        self, *, available_only: bool = True, fields: str = "summary"
+    ) -> list[dict[str, Any]]:
+        fields = _check_fields(fields)
         sql = "SELECT * FROM courses"
         if available_only:
             sql += " WHERE available=1"
         sql += " ORDER BY academic_year DESC, term, course_name"
-        return [self._public_course(row) for row in self.conn.execute(sql)]
+        return [self._public_course(row, fields=fields) for row in self.conn.execute(sql)]
 
     def find_course(self, query: str | int) -> dict[str, Any] | None:
         if isinstance(query, int) or str(query).isdigit():
@@ -533,7 +610,9 @@ class Repository:
         kinds: Sequence[str] | None = None,
         available_only: bool = True,
         limit: int = 100,
+        fields: str = "summary",
     ) -> list[dict[str, Any]]:
+        fields = _check_fields(fields)
         where = ["i.course_id=?"]
         params: list[Any] = [course_id]
         if available_only:
@@ -552,7 +631,7 @@ class Repository:
                 LIMIT ?""",
             params,
         ).fetchall()
-        return [self._public_item(row, include_body=False) for row in rows]
+        return [self._public_item(row, include_body=False, fields=fields) for row in rows]
 
     def get_item(self, item_id: int, *, include_body: bool = True) -> dict[str, Any] | None:
         row = self.conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
@@ -574,10 +653,17 @@ class Repository:
         course_id: int | None = None,
         kinds: Sequence[str] | None = None,
         limit: int = 20,
+        include_text: bool = True,
+        snippet_chars: int = DEFAULT_SNIPPET_CHARS,
     ) -> list[dict[str, Any]]:
         """Ranked item/document hits; see :meth:`search_course_content_detail`."""
         return self.search_course_content_detail(
-            query, course_id=course_id, kinds=kinds, limit=limit
+            query,
+            course_id=course_id,
+            kinds=kinds,
+            limit=limit,
+            include_text=include_text,
+            snippet_chars=snippet_chars,
         )["results"]
 
     def search_course_content_detail(
@@ -587,6 +673,8 @@ class Repository:
         course_id: int | None = None,
         kinds: Sequence[str] | None = None,
         limit: int = 20,
+        include_text: bool = True,
+        snippet_chars: int = DEFAULT_SNIPPET_CHARS,
     ) -> dict[str, Any]:
         """Search items and document chunks, AND-first with ANY fallback.
 
@@ -595,6 +683,10 @@ class Repository:
         query has two or more tokens, rows matching *any* token are returned
         (``match_mode="any"``), ranked by number of matched tokens, then score,
         then recency. ``tokens_unmatched`` lists tokens that hit nothing at all.
+
+        Document results always carry ``snippet`` (a ``snippet_chars`` window
+        around the first matched token, "…" marks a cut) and ``text_chars``;
+        the full ``text`` is included only with ``include_text=True``.
         """
         needle = normalize_search(query)
         tokens = [token for token in needle.split(" ") if token]
@@ -696,8 +788,19 @@ class Repository:
                 key=lambda item: (len(item["tokens_matched"]), item["score"]), reverse=True
             )
         seen_tokens = {token for c in candidates for token in c["tokens_matched"]}
+        results = results[:limit]
+        for result in results:
+            if result["result_type"] != "document":
+                continue
+            text = result["text"]
+            result["snippet"] = make_snippet(
+                text, result["tokens_matched"], snippet_chars=max(1, int(snippet_chars))
+            )
+            result["text_chars"] = len(text)
+            if not include_text:
+                del result["text"]
         return {
-            "results": results[:limit],
+            "results": results,
             "match_mode": match_mode,
             "tokens": unique_tokens,
             "tokens_unmatched": [token for token in unique_tokens if token not in seen_tokens],
@@ -834,7 +937,7 @@ class Repository:
         max_chars: int = 20000,
     ) -> dict[str, Any]:
         search = self.search_course_content_detail(
-            query, course_id=course_id, limit=max(limit * 2, limit)
+            query, course_id=course_id, limit=max(limit * 2, limit), include_text=True
         )
         results = search["results"]
         evidence = []
@@ -962,16 +1065,29 @@ class Repository:
         return digest.hexdigest()
 
     @staticmethod
-    def _public_course(row: sqlite3.Row) -> dict[str, Any]:
+    def _public_course(row: sqlite3.Row, *, fields: str = "full") -> dict[str, Any]:
         out = dict(row)
+        if fields == "summary":
+            return {key: out[key] for key in COURSE_SUMMARY_FIELDS if key in out} | {
+                "available": bool(out["available"])
+            }
         out["instructors"] = json.loads(out.pop("instructors_json") or "[]")
         out["metadata"] = json.loads(out.pop("metadata_json") or "{}")
         out["available"] = bool(out["available"])
         return out
 
     @staticmethod
-    def _public_item(row: sqlite3.Row, *, include_body: bool) -> dict[str, Any]:
+    def _public_item(
+        row: sqlite3.Row, *, include_body: bool, fields: str = "full"
+    ) -> dict[str, Any]:
         out = dict(row)
+        if fields == "summary":
+            summary = {key: out[key] for key in ITEM_SUMMARY_FIELDS if key in out}
+            summary["is_done"] = bool(out["is_done"])
+            summary["available"] = bool(out["available"])
+            if include_body:
+                summary["body"] = out.get("body")
+            return summary
         out["metadata"] = json.loads(out.pop("metadata_json") or "{}")
         out["is_read"] = bool(out["is_read"])
         out["is_done"] = bool(out["is_done"])

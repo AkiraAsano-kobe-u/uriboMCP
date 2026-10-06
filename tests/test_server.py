@@ -170,7 +170,42 @@ def test_read_only_tools_do_not_write(tmp_path: Path, monkeypatch: pytest.Monkey
     assert (wal.stat().st_size if wal.exists() else 0) == wal_before
 
 
+def _seed_long_document(settings) -> None:
+    with database(settings.paths.db_path) as connection:
+        repository = Repository(connection)
+        course = repository.upsert_course(
+            CourseRecord(source="beef", idnumber="C1", course_name="数値解析")
+        )
+        item = repository.upsert_item(
+            ItemRecord(
+                source="beef",
+                source_id="material/C1/1",
+                category="material",
+                title="第3回 誤差",
+                course_name="数値解析",
+                course_id=course.id,
+                metadata={"attachment_manifest": [{"file_name": "a.pdf"}]},
+            )
+        )
+        attachment = repository.upsert_attachment(
+            AttachmentRecord(
+                stable_key="file/1", file_name="a.pdf", item_id=item.id, course_id=course.id
+            )
+        )
+        text = ("前" * 400) + "丸め誤差と打ち切り誤差" + ("後" * 400)
+        repository.replace_document_text(
+            attachment.id,
+            [{"page_number": 1, "text": text, "extraction_method": "native"}],
+            [{"chunk_index": 0, "page_start": 1, "page_end": 1, "text": text}],
+            status="ok",
+            method="native",
+        )
+
+
 def test_real_stdio_handshake_lists_tools(tmp_path: Path) -> None:
+    settings = load_settings(root=tmp_path)
+    _seed_long_document(settings)
+
     async def run() -> None:
         parameters = StdioServerParameters(
             command=sys.executable,
@@ -182,5 +217,71 @@ def test_real_stdio_handshake_lists_tools(tmp_path: Path) -> None:
                 await session.initialize()
                 tools = await session.list_tools()
                 assert {tool.name for tool in tools.tools} == EXPECTED_TOOLS
+                schemas = {tool.name: tool.inputSchema["properties"] for tool in tools.tools}
+                assert schemas["search_course_content"]["include_text"]["default"] is False
+                assert schemas["list_course_content"]["fields"]["default"] == "summary"
+                assert schemas["list_courses"]["fields"]["default"] == "summary"
+
+                slim = await session.call_tool(
+                    "search_course_content", {"query": "誤差 打ち切り", "limit": 5}
+                )
+                assert slim.structuredContent is not None
+                payload = slim.structuredContent
+                assert payload["match_mode"] == "all"
+                assert payload["tokens"] == ["誤差", "打ち切り"]
+                assert payload["tokens_unmatched"] == []
+                document = payload["results"][0]
+                assert document["result_type"] == "document"
+                assert "text" not in document
+                assert "誤差" in document["snippet"]
+                assert document["text_chars"] == 811
+                assert document["tokens_matched"] == ["誤差", "打ち切り"]
+
+                full = await session.call_tool(
+                    "search_course_content",
+                    {"query": "誤差", "limit": 5, "include_text": True},
+                )
+                assert len(full.structuredContent["results"][0]["text"]) == 811
+
+                any_mode = await session.call_tool(
+                    "search_course_content", {"query": "誤差 隤週", "limit": 5}
+                )
+                assert any_mode.structuredContent["match_mode"] == "any"
+                assert any_mode.structuredContent["tokens_unmatched"] == ["隤週"]
+
+                summary = await session.call_tool(
+                    "list_course_content", {"course": "数値解析", "limit": 10}
+                )
+                item = summary.structuredContent["items"][0]
+                assert "metadata" not in item and "content_hash" not in item
+                assert item["attachment_count"] == 1
+                full_items = await session.call_tool(
+                    "list_course_content",
+                    {"course": "数値解析", "limit": 10, "fields": "full"},
+                )
+                assert "metadata" in full_items.structuredContent["items"][0]
+
+                courses = await session.call_tool("list_courses", {})
+                course = courses.structuredContent["courses"][0]
+                assert set(course) == {
+                    "id",
+                    "source",
+                    "idnumber",
+                    "course_code",
+                    "course_name",
+                    "academic_year",
+                    "term",
+                    "schedule_text",
+                    "available",
+                }
+                full_courses = await session.call_tool("list_courses", {"fields": "full"})
+                assert "instructors" in full_courses.structuredContent["courses"][0]
+
+                context = await session.call_tool(
+                    "build_study_context", {"course": "数値解析", "query": "誤差"}
+                )
+                evidence = context.structuredContent["evidence"][0]
+                assert len(evidence["text"]) == 811
+                assert context.structuredContent["match_mode"] == "all"
 
     asyncio.run(run())

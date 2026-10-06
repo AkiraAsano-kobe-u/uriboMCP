@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Sequence
 from pathlib import Path
@@ -11,7 +12,13 @@ import pytest
 
 from uribo_mcp.db import database
 from uribo_mcp.models import AttachmentRecord, CourseRecord, ItemRecord
-from uribo_mcp.repository import Repository, normalize_search
+from uribo_mcp.repository import (
+    COURSE_SUMMARY_FIELDS,
+    ITEM_SUMMARY_FIELDS,
+    Repository,
+    make_snippet,
+    normalize_search,
+)
 
 CHUNKS: dict[str, list[str]] = {
     # file_name -> chunk texts (one chunk per entry)
@@ -517,3 +524,195 @@ def test_build_study_context_passes_match_mode(fixture_db: tuple[Path, dict[str,
     assert "match_mode=any" in loose["note"]
     assert loose["evidence"]
     assert all(len(e["tokens_matched"]) == 1 for e in loose["evidence"])
+
+
+# ------------------------------------------------------------- snippet / include_text
+
+
+LONG_TEXT = ("前置き" * 100) + "ここに誤差の説明がある。" + ("後置き" * 100)
+
+
+def _long_fixture(path: Path) -> dict[str, Any]:
+    with database(path) as conn:
+        repo = Repository(conn)
+        course = repo.upsert_course(CourseRecord(source="beef", idnumber="L1", course_name="長文"))
+        item = repo.upsert_item(
+            ItemRecord(
+                source="beef",
+                source_id="material/L1/1",
+                category="material",
+                title="長文資料",
+                course_name="長文",
+                course_id=course.id,
+            )
+        )
+        attachment = repo.upsert_attachment(
+            AttachmentRecord(
+                stable_key="file/long.pdf", file_name="long.pdf", item_id=item.id, course_id=course.id
+            )
+        )
+        texts = [LONG_TEXT, "短い誤差の章", "ＧＯＳＡ".replace("ＧＯＳＡ", "Ａ" * 200) + "誤差" + "Ｂ" * 200]
+        repo.replace_document_text(
+            attachment.id,
+            [
+                {"page_number": i + 1, "text": t, "extraction_method": "native"}
+                for i, t in enumerate(texts)
+            ],
+            [
+                {"chunk_index": i, "page_start": i + 1, "page_end": i + 1, "text": t}
+                for i, t in enumerate(texts)
+            ],
+            status="ok",
+            method="native",
+        )
+    return {"course": course.id, "attachment": attachment.id}
+
+
+def test_search_snippet_centers_first_match(tmp_path: Path) -> None:
+    path = tmp_path / "long.db"
+    ids = _long_fixture(path)
+    with database(path, readonly=True) as conn:
+        results = Repository(conn).search_course_content(
+            "誤差", course_id=ids["course"], snippet_chars=300
+        )
+    by_page = {r["page_start"]: r for r in results if r["result_type"] == "document"}
+    long = by_page[1]
+    assert long["text_chars"] == len(LONG_TEXT)
+    assert long["text"] == LONG_TEXT
+    assert "誤差" in long["snippet"]
+    assert long["snippet"].startswith("…") and long["snippet"].endswith("…")
+    assert len(long["snippet"]) <= 300 + 2
+    # The match sits in the middle of the window, not at the start.
+    position = long["snippet"].index("誤差")
+    assert 100 < position < 200
+    short = by_page[2]
+    assert short["snippet"] == "短い誤差の章" and short["text_chars"] == len("短い誤差の章")
+    assert "…" not in short["snippet"]
+    # Full-width text: the snippet still contains the match (NFKC offset mapping).
+    assert "誤差" in by_page[3]["snippet"]
+
+
+@pytest.mark.parametrize("original", ["ｶﾞ", "カ\u3099", "e\u0301", "가", "Ｃ言語", "Straße"])
+def test_snippet_matches_whole_string_nfkc(original: str) -> None:
+    text = "前" * 400 + original + "後" * 400
+    snippet = make_snippet(text, [normalize_search(original)], snippet_chars=100)
+    assert original in snippet
+    assert 45 <= snippet.index(original) <= 55
+
+
+def test_search_snippet_window_at_text_edges(tmp_path: Path) -> None:
+    path = tmp_path / "edges.db"
+    with database(path) as conn:
+        repo = Repository(conn)
+        course = repo.upsert_course(CourseRecord(source="beef", idnumber="E1", course_name="端"))
+        item = repo.upsert_item(
+            ItemRecord(
+                source="beef", source_id="m/E1/1", category="material", title="端", course_id=course.id
+            )
+        )
+        att = repo.upsert_attachment(
+            AttachmentRecord(stable_key="f/e", file_name="e.pdf", item_id=item.id, course_id=course.id)
+        )
+        head = "誤差" + "x" * 500
+        tail = "y" * 500 + "誤差"
+        repo.replace_document_text(
+            att.id,
+            [{"page_number": 1, "text": head}, {"page_number": 2, "text": tail}],
+            [
+                {"chunk_index": 0, "page_start": 1, "page_end": 1, "text": head},
+                {"chunk_index": 1, "page_start": 2, "page_end": 2, "text": tail},
+            ],
+            status="ok",
+            method="native",
+        )
+    with database(path, readonly=True) as conn:
+        results = Repository(conn).search_course_content("誤差", course_id=course.id, snippet_chars=100)
+    by_page = {r["page_start"]: r["snippet"] for r in results if r["result_type"] == "document"}
+    assert by_page[1].startswith("誤差") and by_page[1].endswith("…") and len(by_page[1]) == 101
+    assert by_page[2].startswith("…") and by_page[2].endswith("誤差") and len(by_page[2]) == 101
+
+
+def test_search_include_text_false_omits_text_but_keeps_snippet(tmp_path: Path) -> None:
+    path = tmp_path / "long.db"
+    ids = _long_fixture(path)
+    with database(path, readonly=True) as conn:
+        repo = Repository(conn)
+        slim = repo.search_course_content("誤差", course_id=ids["course"], include_text=False)
+        full = repo.search_course_content("誤差", course_id=ids["course"], include_text=True)
+    assert slim and len(slim) == len(full)
+    for result in slim:
+        assert result["result_type"] == "document"
+        assert "text" not in result
+        assert "誤差" in result["snippet"]
+        assert result["text_chars"] > 0
+    for result in full:
+        assert "text" in result and "snippet" in result
+    # Dropping "text" is the only difference.
+    assert slim == [{k: v for k, v in r.items() if k != "text"} for r in full]
+    slim_bytes = len(json.dumps(slim, ensure_ascii=False))
+    full_bytes = len(json.dumps(full, ensure_ascii=False))
+    assert slim_bytes < full_bytes - len(LONG_TEXT)
+
+
+def test_build_study_context_uses_full_text_not_snippet(tmp_path: Path) -> None:
+    path = tmp_path / "long.db"
+    ids = _long_fixture(path)
+    with database(path, readonly=True) as conn:
+        context = Repository(conn).build_study_context("誤差", course_id=ids["course"])
+    texts = {e["text"] for e in context["evidence"]}
+    assert LONG_TEXT in texts
+    assert all("snippet" not in e for e in context["evidence"])
+
+
+# --------------------------------------------------------------- fields="summary"
+
+
+def test_list_course_content_summary_fields(fixture_db: tuple[Path, dict[str, Any]]) -> None:
+    path, ids = fixture_db
+    dropped = {
+        "metadata",
+        "content_hash",
+        "source_id",
+        "first_seen_at",
+        "last_seen_at",
+        "created_at",
+        "remote_updated_at",
+        "cluster_id",
+        "is_read",
+        "importance",
+        "body",
+    }
+    with database(path, readonly=True) as conn:
+        repo = Repository(conn)
+        summary = repo.list_course_content(ids["c1"], fields="summary")
+        full = repo.list_course_content(ids["c1"], fields="full")
+        default = repo.list_course_content(ids["c1"])
+        with pytest.raises(ValueError):
+            repo.list_course_content(ids["c1"], fields="bogus")
+    assert summary and len(summary) == len(full)
+    assert default == summary  # Both repository and tool default to summary.
+    for item in summary:
+        assert set(item) == set(ITEM_SUMMARY_FIELDS)
+        assert not (set(item) & dropped)
+        assert isinstance(item["is_done"], bool) and isinstance(item["available"], bool)
+    for item in full:
+        assert dropped - {"body"} <= set(item)
+        assert "body" not in item
+        assert isinstance(item["metadata"], dict)
+    assert [i["id"] for i in summary] == [i["id"] for i in full]
+
+
+def test_list_courses_summary_fields(fixture_db: tuple[Path, dict[str, Any]]) -> None:
+    path, ids = fixture_db
+    with database(path, readonly=True) as conn:
+        repo = Repository(conn)
+        summary = repo.list_courses(fields="summary")
+        full = repo.list_courses(fields="full")
+        assert repo.list_courses() == summary
+    assert len(summary) == len(full) == 2
+    for course in summary:
+        assert set(course) == set(COURSE_SUMMARY_FIELDS)
+        assert isinstance(course["available"], bool)
+    for course in full:
+        assert {"instructors", "metadata", "summary", "source_url", "content_hash"} <= set(course)
+    assert [c["id"] for c in summary] == [c["id"] for c in full]
