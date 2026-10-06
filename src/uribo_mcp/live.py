@@ -220,7 +220,11 @@ def open_moodle(
 
     driver = (driver_factory or make_chrome_driver)()
     try:
-        _inject_vault(driver, vault, source, f"https://{host}")
+        # Start from a clean browser: the saved cookies were just proven stale
+        # by _restore_moodle, and a stale MoodleSession injected before the
+        # Shibboleth round trip can make Moodle reject the new session
+        # (auth/shibboleth errorcode=4).  The first, successful live login ran
+        # with an empty vault.
         driver.get(landing)
         # Shibboleth hops through beef.center.../Shibboleth.sso and the IdP
         # with auto-submitting pages, so get() can return mid-chain while the
