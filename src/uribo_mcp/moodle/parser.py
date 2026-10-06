@@ -200,11 +200,11 @@ def parse_course_page(html: str, *, base_url: str) -> dict[str, Any]:
                 else [],
             }
         )
-    body = soup.select_one("body")
+    # A course page always renders its sections; Moodle's error page can keep
+    # the course-view body id, so the id alone is not evidence.
     is_course_page = bool(
-        str(body.get("id") if body else "").startswith("page-course-view")
-        or soup.select_one(_SECTION_SELECTOR)
-    )
+        soup.select_one(_SECTION_SELECTOR) or soup.select_one(".course-content li.section")
+    ) and not soup.select_one(".errorbox, [data-rel='fatalerror'], #notice")
     return {
         "summary": "\n".join(summary_parts) or None,
         "activities": activities,

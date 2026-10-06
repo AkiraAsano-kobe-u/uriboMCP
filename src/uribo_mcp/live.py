@@ -71,6 +71,7 @@ def _inject_vault(driver, vault: CookieVault, source: str, base_url: str) -> boo
 def _login_once(driver, start_url: str, expected_host: str) -> None:
     from selenium.webdriver.support.ui import WebDriverWait
 
+    credentials = load_credentials()  # fail before touching the SSO pages
     driver.get(start_url)
     wait = WebDriverWait(driver, 25)
     wait.until(
@@ -79,34 +80,51 @@ def _login_once(driver, start_url: str, expected_host: str) -> None:
     )
     if expected_host in driver.current_url and "knossos" not in driver.current_url:
         return
-    _submit_knossos_form(driver, expected_host)
+    _submit_knossos_form(driver, expected_host, credentials)
 
 
-def _submit_knossos_form(driver, expected_host: str) -> None:
-    """Fill and submit the KNOSSOS form on the current page exactly once."""
+def _url_label(url: str) -> str:
+    """Host and path only; SAML/OIDC query strings never go into messages."""
+    parsed = urlparse(str(url))
+    return f"{parsed.netloc}{parsed.path}"
+
+
+def _submit_knossos_form(driver, expected_host: str, credentials=None) -> None:
+    """Fill and submit the KNOSSOS form on the current page exactly once.
+
+    Any failure after the submit click is reported as AuthenticationRequired
+    so the caller blocks further SSO attempts in the same run.
+    """
     from selenium.common.exceptions import TimeoutException
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
 
-    credentials = load_credentials()
+    credentials = credentials or load_credentials()
     wait = WebDriverWait(driver, 25)
     wait.until(lambda current: current.find_elements(By.ID, "username"))
     driver.find_element(By.ID, "username").send_keys(credentials.username)
     driver.find_element(By.ID, "password").send_keys(credentials.password)
     # One attempt only. Retrying can lock the university account.
     try:
-        driver.find_element(By.ID, "kc-login").click()
-    except TimeoutException:
-        pass
-    # After the form, SAML hops through the IdP host before reaching the
-    # service; wait for the service host itself, not merely "left KNOSSOS".
-    try:
-        WebDriverWait(driver, 25).until(
-            lambda current: expected_host in urlparse(current.current_url).netloc
-        )
-    except Exception:
-        pass
-    if "knossos" in driver.current_url or expected_host not in driver.current_url:
+        try:
+            driver.find_element(By.ID, "kc-login").click()
+        except TimeoutException:
+            pass
+        # After the form, SAML hops through the IdP host before reaching the
+        # service; wait for the service host itself, not merely "left KNOSSOS".
+        try:
+            WebDriverWait(driver, 25).until(
+                lambda current: expected_host in urlparse(current.current_url).netloc
+            )
+        except TimeoutException:
+            pass
+        final = urlparse(str(driver.current_url)).netloc
+    except Exception as exc:
+        raise AuthenticationRequired(
+            f"KNOSSOS login was submitted but did not complete ({type(exc).__name__}); "
+            "the server will not retry automatically."
+        ) from exc
+    if "knossos" in final or expected_host not in final:
         raise AuthenticationRequired(
             "KNOSSOS login failed. Credentials, MFA, or the login page may have changed; "
             "the server will not retry automatically."
@@ -155,16 +173,20 @@ def authenticated_lms(
         driver.quit()
 
 
-def _wait_for_sso_settle(driver, signed_in, timeout: float = 25.0) -> None:
+def _wait_for_sso_settle(
+    driver, signed_in, timeout: float = 25.0, *, clock=None, sleep=None
+) -> None:
     """Poll until the browser is on a signed-in page or the KNOSSOS form."""
     import time
 
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    clock = clock or time.monotonic
+    sleep = sleep or time.sleep
+    deadline = clock() + timeout
+    while clock() < deadline:
         url = str(driver.current_url)
         if signed_in(url) or "knossos" in urlparse(url).netloc:
             return
-        time.sleep(0.5)
+        sleep(0.5)
 
 
 def _moodle_login(driver, landing: str, host: str) -> None:
@@ -193,6 +215,8 @@ def open_moodle(
     source: str = "moodle",
     driver_factory=None,
     login=None,
+    clock=None,
+    sleep=None,
 ) -> MoodleReadOnlyClient:
     """Return a signed-in Moodle client: saved cookies first, else one SSO login.
 
@@ -208,6 +232,8 @@ def open_moodle(
     restored = _restore_moodle(vault, source, base_url)
     if restored is not None:
         return restored
+    if login is None:
+        load_credentials()  # fail before opening a browser or the SSO pages
 
     def signed_in(url: str) -> bool:
         parsed = urlparse(url)
@@ -231,24 +257,23 @@ def open_moodle(
         # URL is still on the Moodle host.  Wait until the chain settles on
         # either the Moodle page or KNOSSOS before deciding to log in;
         # _login_once would otherwise see the Moodle host and skip the form.
-        _wait_for_sso_settle(driver, signed_in)
+        _wait_for_sso_settle(driver, signed_in, clock=clock, sleep=sleep)
         if not signed_in(driver.current_url):
             if "knossos" not in urlparse(str(driver.current_url)).netloc:
                 raise AuthenticationRequired(
-                    f"Moodle sign-in did not reach KNOSSOS (stopped at {driver.current_url})"
+                    f"Moodle sign-in did not reach KNOSSOS (stopped at {_url_label(driver.current_url)})"
                 )
             # Already on the KNOSSOS form: submit it once, without re-navigating
             # (re-navigating would restart the Shibboleth chain).
             (login or _moodle_login)(driver, landing, host)
-            _wait_for_sso_settle(driver, signed_in)
+            _wait_for_sso_settle(driver, signed_in, clock=clock, sleep=sleep)
             if not signed_in(driver.current_url):
                 driver.get(landing)
-                _wait_for_sso_settle(driver, signed_in)
+                _wait_for_sso_settle(driver, signed_in, clock=clock, sleep=sleep)
         if not signed_in(driver.current_url):
-            stop = urlparse(str(driver.current_url))
             raise AuthenticationRequired(
                 f"Could not open authenticated Moodle page: {landing} "
-                f"(stopped at {stop.netloc}{stop.path})"
+                f"(stopped at {_url_label(driver.current_url)})"
             )
         vault.save(source, driver.get_cookies())
         session = _requests_from_driver(driver)

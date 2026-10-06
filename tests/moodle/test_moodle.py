@@ -890,59 +890,257 @@ def test_failed_sso_skips_later_sso_sources(tmp_path: Path, monkeypatch) -> None
     assert results["csi"]["status"] == "ok"
 
 
-def test_open_moodle_waits_for_shibboleth_chain_before_login(tmp_path: Path, monkeypatch) -> None:
-    """Live failure 2026-10-06: get() returned mid-chain on the Moodle host,
-    the old login helper saw the Moodle host and skipped the form."""
+class _Clock:
+    """Fake monotonic clock advanced only by the injected sleep."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class _TimedDriver:
+    """Browser whose URL follows a scripted redirect chain over (fake) time."""
+
+    def __init__(self, clock, chain, after_login=None):
+        self.clock, self.chain, self.after_login = clock, chain, after_login or []
+        self.started = 0.0
+        self.active = chain
+        self.cookies_added = []
+        self.events = []
+        self.quit_called = False
+
+    @property
+    def current_url(self):
+        elapsed = self.clock() - self.started
+        url = self.active[0][1]
+        for at, step in self.active:
+            if elapsed >= at:
+                url = step
+        return url
+
+    def get(self, url):
+        self.events.append(("get", url))
+        self.started = self.clock()
+
+    def submitted(self):
+        self.events.append(("submit", self.current_url))
+        self.active = self.after_login
+        self.started = self.clock()
+
+    def add_cookie(self, cookie):
+        self.cookies_added.append(cookie)
+        self.events.append(("add_cookie", cookie.get("name")))
+
+    def get_cookies(self):
+        return [{"name": "MoodleSession", "value": "new", "domain": "beef.center.kobe-u.ac.jp", "path": "/"}]
+
+    def quit(self):
+        self.quit_called = True
+
+
+SHIB_CHAIN = [
+    (0.0, "https://beef.center.kobe-u.ac.jp/Shibboleth.sso/Login?target=x"),
+    (1.0, "https://idp.center.kobe-u.ac.jp/idp/profile/SAML2/Redirect/SSO?SAMLRequest=SECRET"),
+    (2.0, "https://knossos.center.kobe-u.ac.jp/auth/realms/loginid/protocol/openid-connect/auth?state=s"),
+]
+AFTER_LOGIN = [
+    (0.0, "https://idp.center.kobe-u.ac.jp/idp/profile/SAML2/Redirect/SSO?execution=e1s1"),
+    (1.0, "https://beef.center.kobe-u.ac.jp/Shibboleth.sso/SAML2/POST"),
+    (2.0, f"{BASE}/my/courses.php"),
+]
+
+
+@pytest.fixture
+def moodle_live(tmp_path, monkeypatch):
     from uribo_mcp import live
-    from uribo_mcp.errors import AuthenticationRequired
+    from uribo_mcp.auth import CookieVault
 
     settings = load_settings(root=tmp_path)
+    # stale cookies in the vault: restore must fail without any network access
+    CookieVault(settings.paths.credentials_dir).save("moodle", [{"name": "MoodleSession", "value": "old", "domain": "beef.center.kobe-u.ac.jp"}])
+    expired = _Session({f"{BASE}/my/courses.php": _redirect(f"{BASE}/login/index.php")})
+    monkeypatch.setattr(live, "_requests_from_cookies", lambda cookies: expired)
     monkeypatch.setattr(live, "_requests_from_driver", lambda driver: _Session())
-    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    return live, settings
 
-    class ChainDriver(_FakeDriver):
-        def __init__(self):
-            super().__init__()
-            self.steps = []
 
-        def get(self, url):
-            if self.logged_in:
-                self.current_url = url
-            elif "favicon" in url:
-                self.current_url = url
-            else:  # mid-chain first, KNOSSOS on the next poll
-                self.steps = ["https://beef.center.kobe-u.ac.jp/Shibboleth.sso/SAML2/POST",
-                              "https://knossos.center.kobe-u.ac.jp/auth"]
-                self.current_url = self.steps.pop(0)
+def test_open_moodle_waits_for_shibboleth_chain_before_login(moodle_live) -> None:
+    """Live failure 2026-10-06: get() returned mid-chain on the Moodle host and
+    the old helper skipped the form.  The chain advances with fake time only."""
+    live, settings = moodle_live
+    clock = _Clock()
+    driver = _TimedDriver(clock, SHIB_CHAIN, AFTER_LOGIN)
+    submitted_on = []
 
-        def __getattribute__(self, name):
-            if name == "current_url":
-                steps = object.__getattribute__(self, "__dict__").get("steps")
-                value = object.__getattribute__(self, "__dict__")["current_url"]
-                if steps:
-                    object.__getattribute__(self, "__dict__")["current_url"] = steps.pop(0)
-                return value
-            return object.__getattribute__(self, name)
+    def login(drv, url, host):
+        submitted_on.append(drv.current_url)
+        drv.submitted()
 
+    client = live.open_moodle(
+        settings, base_url=BASE, driver_factory=lambda: driver, login=login, clock=clock, sleep=clock.sleep
+    )
+    assert client.has_session_key and driver.quit_called
+    assert len(submitted_on) == 1 and "knossos" in submitted_on[0]
+    assert clock.now >= 2.0  # it actually waited for the chain to settle
+    # no stale cookie was injected into the SSO browser (fc0e718)
+    assert driver.cookies_added == []
+    assert driver.events[0][0] == "get"
+
+
+def test_open_moodle_never_submits_without_knossos_and_hides_query(moodle_live) -> None:
+    from uribo_mcp.errors import AuthenticationRequired
+
+    live, settings = moodle_live
+    clock = _Clock()
+    stuck = _TimedDriver(clock, [(0.0, "https://idp.center.kobe-u.ac.jp/idp/error?SAMLRequest=SECRET&RelayState=r")])
+    submitted = []
+    with pytest.raises(AuthenticationRequired) as caught:
+        live.open_moodle(
+            settings, base_url=BASE, driver_factory=lambda: stuck,
+            login=lambda d, u, h: submitted.append(u), clock=clock, sleep=clock.sleep,
+        )
+    assert submitted == [] and stuck.quit_called
+    assert "SECRET" not in str(caught.value) and "idp.center.kobe-u.ac.jp/idp/error" in str(caught.value)
+
+
+def test_signed_in_excludes_shibboleth_endpoint(moodle_live) -> None:
+    """Without the /Shibboleth.sso exclusion the first poll would count as signed in."""
+    live, settings = moodle_live
+    clock = _Clock()
+    driver = _TimedDriver(clock, SHIB_CHAIN, AFTER_LOGIN)
     logins = []
+    live.open_moodle(
+        settings, base_url=BASE, driver_factory=lambda: driver,
+        login=lambda d, u, h: (logins.append(1), d.submitted()), clock=clock, sleep=clock.sleep,
+    )
+    assert logins == [1]
+    session = _Session({f"{BASE}/course/view.php": _redirect("https://beef.center.kobe-u.ac.jp/Shibboleth.sso/Login")})
+    with pytest.raises(MoodleSessionExpired):
+        MoodleReadOnlyClient(session, base_url=BASE).fetch_course(1)
 
-    def login(driver, url, host):
-        assert "knossos" in driver.current_url, "form must be submitted on the KNOSSOS page"
-        logins.append(url)
-        driver.logged_in = True
-        driver.current_url = url
 
-    client = live.open_moodle(settings, base_url=BASE, driver_factory=ChainDriver, login=login)
-    assert len(logins) == 1 and client.has_session_key
+class _SelDriver:
+    """Minimal Selenium-like driver for _submit_knossos_form."""
 
-    class StuckDriver(_FakeDriver):
-        def get(self, url):
-            self.current_url = "https://idp.center.kobe-u.ac.jp/idp/error"
+    def __init__(self, after_click):
+        self.current_url = "https://knossos.center.kobe-u.ac.jp/auth"
+        self.after_click = after_click
+        self.clicks = 0
+        self.reads = 0
 
-    monkeypatch.setattr("time.monotonic", iter(range(0, 1000, 30)).__next__)
+    def find_elements(self, by, value):
+        return [object()]
+
+    def find_element(self, by, value):
+        driver = self
+
+        class _El:
+            def send_keys(self, text):
+                pass
+
+            def click(self):
+                driver.clicks += 1
+                driver.after_click(driver)
+
+        return _El()
+
+
+def test_submit_form_waits_for_service_host_through_idp(monkeypatch) -> None:
+    from uribo_mcp import live
+    from uribo_mcp.auth import KobeCredentials
+
+    hops = iter(["https://idp.center.kobe-u.ac.jp/idp/profile/SAML2", "https://idp.center.kobe-u.ac.jp/idp/x",
+                 "https://beefplus.center.kobe-u.ac.jp/lms/timetable"])
+
+    class Hopping(_SelDriver):
+        @property
+        def current_url(self):
+            return self._url
+
+        @current_url.setter
+        def current_url(self, value):
+            self._url = value
+
+    def after_click(d):
+        d._advance = True
+
+    driver = Hopping(after_click)
+    original = type(driver).current_url
+
+    def url(self):
+        if getattr(self, "_advance", False):
+            self._url = next(hops, self._url)
+        return self._url
+
+    monkeypatch.setattr(Hopping, "current_url", property(url, original.fset))
+    live._submit_knossos_form(driver, "beefplus.center.kobe-u.ac.jp", KobeCredentials("u", "p"))
+    assert driver.clicks == 1 and "beefplus" in driver.current_url
+
+
+def test_submit_form_failure_after_click_is_authentication_required() -> None:
+    from uribo_mcp import live
+    from uribo_mcp.auth import KobeCredentials
+    from uribo_mcp.errors import AuthenticationRequired
+
+    class Crashing(_SelDriver):
+        @property
+        def current_url(self):
+            if self.clicks:
+                raise RuntimeError("browser crashed")
+            return "https://knossos.center.kobe-u.ac.jp/auth"
+
+        @current_url.setter
+        def current_url(self, value):
+            pass
+
+    driver = Crashing(lambda d: None)
     with pytest.raises(AuthenticationRequired):
-        live.open_moodle(settings, base_url=BASE, driver_factory=StuckDriver, login=login)
-    assert len(logins) == 1  # never submitted when KNOSSOS was not reached
+        live._submit_knossos_form(driver, "beefplus.center.kobe-u.ac.jp", KobeCredentials("u", "p"))
+    assert driver.clicks == 1
+
+
+def test_course_view_error_page_is_not_a_course_page(tmp_path: Path) -> None:
+    error = '<body id="page-course-view"><div class="errorbox" data-rel="fatalerror">エラー</div></body>'
+    assert parse_course_page(error, base_url=BASE)["is_course_page"] is False
+    settings = load_settings(root=tmp_path)
+    _sync(settings, FakeMoodleClient())
+    result = _sync(settings, FakeMoodleClient(error))
+    assert result["courses"]["2026_3X004"]["status"] == "error"
+    assert all(row["available"] == 1 for row in _rows(settings).values())
+
+
+def test_removed_deadline_is_dropped_when_calendar_covered_it(tmp_path: Path, monkeypatch) -> None:
+    settings = load_settings(root=tmp_path)
+    _sync(settings, FakeMoodleClient())
+    assert _rows(settings)["test/2026_3X004/102"]["deadline"] == "2026-10-15T23:59"
+    monkeypatch.setattr(FakeMoodleClient, "calendar_month", lambda self, y, m: [])
+    _sync(settings, FakeMoodleClient())  # calendar OK, October in window, event gone
+    assert _rows(settings)["test/2026_3X004/102"]["deadline"] is None
+
+
+def test_assignment_keeps_stored_deadline_only_when_unseen(tmp_path: Path, monkeypatch) -> None:
+    global ASSIGN_HTML
+    settings = load_settings(root=tmp_path)
+    _sync(settings, FakeMoodleClient())
+    original = ASSIGN_HTML
+    try:
+        ASSIGN_HTML = original.replace("<div><strong>期限:</strong> 2026年 10月 19日(月曜日) 23:59</div>", "")
+
+        class NoCalendar(FakeMoodleClient):
+            def calendar_month(self, year, month):
+                raise ConnectionError("down")
+
+        _sync(settings, NoCalendar())
+        assert _rows(settings)["assignment/2026_3X004/104"]["deadline"] == "2026-10-19T23:59"
+        _sync(settings, FakeMoodleClient())  # calendar fine, page shows no deadline
+        assert _rows(settings)["assignment/2026_3X004/104"]["deadline"] is None
+    finally:
+        ASSIGN_HTML = original
 
 
 def test_beef_schedule_also_runs_moodle_when_enabled(tmp_path: Path, monkeypatch) -> None:

@@ -117,6 +117,7 @@ class MoodleSynchronizer:
         self.client = client
         self.pause = pause or (lambda: None)
         self.today = today or date.today()
+        self._calendar_ok = True
         self.attachments = AttachmentIngestor(
             settings=settings, repository=repository, downloader=client, pause=self.pause
         )
@@ -139,6 +140,7 @@ class MoodleSynchronizer:
                 calendar_ok = False
                 LOGGER.warning("Moodle calendar %s-%02d failed: %s", year, month, exc)
         deadlines = calendar_deadlines(events)
+        self._calendar_ok = calendar_ok
         results: dict[str, Any] = {}
         for course in courses:
             if wanted and not wanted.intersection(
@@ -266,6 +268,24 @@ class MoodleSynchronizer:
                 )
         return missing
 
+    def _fallback_deadline(self, source_id: str) -> str | None:
+        """Keep a stored deadline only when this run could not have seen it.
+
+        That is: the calendar failed, or the stored date lies outside the
+        fetched calendar window.  If the calendar covered that month and no
+        longer lists the deadline, the teacher removed it and it is dropped.
+        """
+        stored = self._stored_deadline(source_id)
+        if not stored:
+            return None
+        if not self._calendar_ok:
+            return stored
+        try:
+            year, month = int(stored[:4]), int(stored[5:7])
+        except ValueError:
+            return None
+        return None if (year, month) in set(_month_window(self.today)) else stored
+
     def _stored_deadline(self, source_id: str) -> str | None:
         row = self.repository.conn.execute(
             "SELECT deadline FROM items WHERE source=? AND source_id=?", (SOURCE, source_id)
@@ -321,7 +341,7 @@ class MoodleSynchronizer:
             draft.metadata["expected_completion"] = calendar["expected_completion"]
         if category in METADATA_ONLY:
             draft.metadata["read_policy"] = "metadata_only"
-            draft.deadline = calendar.get("deadline") or self._stored_deadline(draft.source_id)
+            draft.deadline = calendar.get("deadline") or self._fallback_deadline(draft.source_id)
             return draft
         detail: dict[str, Any] = {}
         try:
@@ -350,7 +370,7 @@ class MoodleSynchronizer:
         draft.deadline = (
             calendar.get("deadline")
             or detail.get("deadline")
-            or self._stored_deadline(draft.source_id)
+            or self._fallback_deadline(draft.source_id)
         )
         for key in ("submission_status", "dates"):
             if detail.get(key):
