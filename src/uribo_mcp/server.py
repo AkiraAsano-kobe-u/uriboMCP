@@ -380,7 +380,13 @@ def build_server(settings: Settings | None = None):
         kinds: list[str] | None = None,
         limit: int = 20,
     ) -> dict[str, Any]:
-        """授業本文と抽出済みPDF／Office文書を横断検索する。"""
+        """授業本文と抽出済みPDF／Office文書を横断検索する。
+
+        複数語のクエリは全語を含む結果を優先する（match_mode="all"）。全語一致が
+        0件のときは語ごとの一致に自動で切り替え（match_mode="any"）、一致語数→
+        スコア順で返す。各結果の tokens_matched と tokens_unmatched（どの資料にも
+        無い語）を見て、語を削って再検索する前に判断すること。
+        """
         with database(settings.paths.db_path, readonly=True) as conn:
             repository = Repository(conn)
             course_id = None
@@ -390,16 +396,20 @@ def build_server(settings: Settings | None = None):
                 if not selected:
                     return {"found": False, "course": course, "results": []}
                 course_id = selected["id"]
-            results = repository.search_course_content(
+            search = repository.search_course_content_detail(
                 query,
                 course_id=course_id,
                 kinds=kinds,
                 limit=_limit(settings, limit),
             )
+        results = search["results"]
         return {
             "found": True,
             "course": selected,
             "count": len(results),
+            "match_mode": search["match_mode"],
+            "tokens": search["tokens"],
+            "tokens_unmatched": search["tokens_unmatched"],
             "results": results,
         }
 

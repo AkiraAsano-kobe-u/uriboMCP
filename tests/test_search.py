@@ -308,12 +308,20 @@ def test_search_sql_scan_matches_python_reference(
     fixture_db: tuple[Path, dict[str, Any]], query: str, options: dict[str, Any]
 ) -> None:
     path, ids = fixture_db
+    token_count = len(set(normalize_search(query).split()))
     for course_id in (None, ids["c1"], ids["c2"]):
         with database(path, readonly=True) as conn:
             expected = reference_search(conn, query, course_id=course_id, **options)
-            actual = Repository(conn).search_course_content(
+            detail = Repository(conn).search_course_content_detail(
                 query, course_id=course_id, **options
             )
+        actual = detail["results"]
+        if not expected and token_count >= 2:
+            # The only intended divergence from the old scan: a multi-token query
+            # with no all-token row falls back to per-token matches.
+            assert detail["match_mode"] == "any", (query, course_id)
+            continue
+        assert detail["match_mode"] == "all", (query, course_id)
         assert [_key(r) for r in actual] == [_key(r) for r in expected], (query, course_id)
         for got, want in zip(actual, expected, strict=True):
             if got["result_type"] == "document":
@@ -409,3 +417,103 @@ def test_search_ranks_by_occurrence_count(fixture_db: tuple[Path, dict[str, Any]
     assert docs[0]["score"] == 4
     assert docs[0]["score"] > docs[1]["score"]
     assert [d["score"] for d in docs] == sorted((d["score"] for d in docs), reverse=True)
+
+
+# ----------------------------------------------------------- AND-first / ANY fallback
+
+
+def test_search_prefers_all_token_matches(fixture_db: tuple[Path, dict[str, Any]]) -> None:
+    path, ids = fixture_db
+    with database(path, readonly=True) as conn:
+        search = Repository(conn).search_course_content_detail("テイラー 誤差", limit=50)
+    assert search["match_mode"] == "all"
+    assert search["tokens"] == ["テイラー", "誤差"]
+    assert search["tokens_unmatched"] == []
+    assert search["results"]
+    for result in search["results"]:
+        assert result["tokens_matched"] == ["テイラー", "誤差"]
+    # Rows that contain only one of the tokens (e.g. c_intro.pdf 誤差) are excluded.
+    assert all(
+        r["result_type"] != "document" or r["file_name"] != "c_intro.pdf"
+        for r in search["results"]
+    )
+
+
+def test_search_falls_back_to_any_token_match(fixture_db: tuple[Path, dict[str, Any]]) -> None:
+    path, ids = fixture_db
+    with database(path, readonly=True) as conn:
+        repo = Repository(conn)
+        # No chunk/item contains both tokens: the old AND-only scan returned nothing.
+        assert reference_search(conn, "広義積分 ポインタ", limit=50) == []
+        search = repo.search_course_content_detail("広義積分 ポインタ", limit=50)
+    assert search["match_mode"] == "any"
+    assert search["tokens_unmatched"] == []
+    docs = [r for r in search["results"] if r["result_type"] == "document"]
+    assert {r["file_name"] for r in docs} == {"taylor.pdf", "c_intro.pdf"}
+    for result in search["results"]:
+        assert len(result["tokens_matched"]) == 1
+    with database(path, readonly=True) as conn:
+        search = Repository(conn).search_course_content_detail(
+            "固有値 ポインタ 広義積分", course_id=ids["c1"], limit=50
+        )
+    assert search["match_mode"] == "any"
+    matched_counts = [len(r["tokens_matched"]) for r in search["results"]]
+    assert matched_counts == sorted(matched_counts, reverse=True)
+    assert matched_counts[0] == 2  # taylor.pdf p2 has 収束判定 広義積分 / 固有値
+    top = search["results"][0]
+    assert top["result_type"] == "document" and top["page_start"] == 2
+    # Within an equal tokens_matched count, higher score first.
+    pairs = [(len(r["tokens_matched"]), r["score"]) for r in search["results"]]
+    assert pairs == sorted(pairs, reverse=True)
+
+
+def test_search_reports_unmatched_tokens(fixture_db: tuple[Path, dict[str, Any]]) -> None:
+    path, ids = fixture_db
+    with database(path, readonly=True) as conn:
+        search = Repository(conn).search_course_content_detail("隤週 誤差 収束判定", limit=50)
+    assert search["match_mode"] == "any"
+    assert search["tokens_unmatched"] == ["隤週"]
+    assert search["results"]
+    assert all("隤週" not in r["tokens_matched"] for r in search["results"])
+
+
+def test_single_token_query_never_uses_any_mode(fixture_db: tuple[Path, dict[str, Any]]) -> None:
+    path, ids = fixture_db
+    with database(path, readonly=True) as conn:
+        repo = Repository(conn)
+        hit = repo.search_course_content_detail("誤差", limit=50)
+        miss = repo.search_course_content_detail("存在しない語", limit=50)
+        # Repeated tokens are one token.
+        dup = repo.search_course_content_detail("誤差 誤差", limit=50)
+    assert hit["match_mode"] == "all" and hit["results"]
+    assert miss["match_mode"] == "all" and miss["results"] == []
+    assert miss["tokens_unmatched"] == ["存在しない語"]
+    assert dup["match_mode"] == "all" and dup["tokens"] == ["誤差"]
+
+
+def test_single_token_results_identical_to_legacy_api(
+    fixture_db: tuple[Path, dict[str, Any]],
+) -> None:
+    path, ids = fixture_db
+    with database(path, readonly=True) as conn:
+        repo = Repository(conn)
+        detail = repo.search_course_content_detail("固有値", limit=50)["results"]
+        legacy = repo.search_course_content("固有値", limit=50)
+        reference = reference_search(conn, "固有値", limit=50)
+    assert [_key(r) for r in detail] == [_key(r) for r in legacy] == [_key(r) for r in reference]
+
+
+def test_build_study_context_passes_match_mode(fixture_db: tuple[Path, dict[str, Any]]) -> None:
+    path, ids = fixture_db
+    with database(path, readonly=True) as conn:
+        repo = Repository(conn)
+        strict = repo.build_study_context("テイラー 誤差", course_id=ids["c1"])
+        loose = repo.build_study_context("広義積分 ポインタ", course_id=ids["c1"])
+    assert strict["match_mode"] == "all"
+    assert strict["tokens"] == ["テイラー", "誤差"]
+    assert strict["tokens_unmatched"] == []
+    assert all(e["tokens_matched"] == ["テイラー", "誤差"] for e in strict["evidence"])
+    assert loose["match_mode"] == "any"
+    assert "match_mode=any" in loose["note"]
+    assert loose["evidence"]
+    assert all(len(e["tokens_matched"]) == 1 for e in loose["evidence"])

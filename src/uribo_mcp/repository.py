@@ -575,10 +575,37 @@ class Repository:
         kinds: Sequence[str] | None = None,
         limit: int = 20,
     ) -> list[dict[str, Any]]:
+        """Ranked item/document hits; see :meth:`search_course_content_detail`."""
+        return self.search_course_content_detail(
+            query, course_id=course_id, kinds=kinds, limit=limit
+        )["results"]
+
+    def search_course_content_detail(
+        self,
+        query: str,
+        *,
+        course_id: int | None = None,
+        kinds: Sequence[str] | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Search items and document chunks, AND-first with ANY fallback.
+
+        Every row containing *all* tokens wins (``match_mode="all"``, identical to
+        the historical behaviour). Only when no row contains all tokens and the
+        query has two or more tokens, rows matching *any* token are returned
+        (``match_mode="any"``), ranked by number of matched tokens, then score,
+        then recency. ``tokens_unmatched`` lists tokens that hit nothing at all.
+        """
         needle = normalize_search(query)
-        if not needle:
-            return []
         tokens = [token for token in needle.split(" ") if token]
+        unique_tokens = list(dict.fromkeys(tokens))
+        if not tokens:
+            return {
+                "results": [],
+                "match_mode": "all",
+                "tokens": [],
+                "tokens_unmatched": [],
+            }
         where = ["i.available=1"]
         params: list[Any] = []
         if course_id is not None:
@@ -587,7 +614,7 @@ class Repository:
         if kinds:
             where.append(f"i.category IN ({','.join('?' for _ in kinds)})")
             params.extend(kinds)
-        results: list[dict[str, Any]] = []
+        candidates: list[dict[str, Any]] = []
         for row in self.conn.execute(
             f"SELECT i.* FROM items i WHERE {' AND '.join(where)} "
             "ORDER BY i.updated_at DESC",
@@ -598,24 +625,26 @@ class Repository:
                     filter(None, (row["title"], row["body"], row["course_name"]))
                 )
             )
-            if all(token in haystack for token in tokens):
-                results.append(
+            matched = [token for token in unique_tokens if token in haystack]
+            if matched:
+                candidates.append(
                     {
                         "result_type": "item",
                         "item": self._public_item(row, include_body=True),
                         "score": sum(haystack.count(token) for token in tokens),
+                        "tokens_matched": matched,
                     }
                 )
 
         # search_text is normalize_search()'d at write time and the query at read
         # time, so SQL instr() substring matching is exactly the Python `in` test.
-        # Candidates are pre-filtered with OR in SQL; the AND decision and the
+        # Candidates are pre-filtered with OR in SQL; the AND/ANY decision and the
         # score stay in Python on the (small) candidate set.
         doc_where = [
             "a.available=1",
-            "(" + " OR ".join("instr(dc.search_text, ?)>0" for _ in tokens) + ")",
+            "(" + " OR ".join("instr(dc.search_text, ?)>0" for _ in unique_tokens) + ")",
         ]
-        doc_params: list[Any] = [*tokens]
+        doc_params: list[Any] = [*unique_tokens]
         if course_id is not None:
             doc_where.append("a.course_id=?")
             doc_params.append(course_id)
@@ -635,23 +664,44 @@ class Repository:
         )
         for row in rows:
             search_text = row["search_text"]
-            if all(token in search_text for token in tokens):
-                results.append(
-                    {
-                        "result_type": "document",
-                        "attachment_id": row["attachment_id"],
-                        "file_name": row["file_name"],
-                        "course_id": row["course_id"],
-                        "course_name": row["course_name"],
-                        "category": row["category"],
-                        "page_start": row["page_start"],
-                        "page_end": row["page_end"],
-                        "text": row["text"],
-                        "score": sum(search_text.count(token) for token in tokens),
-                    }
-                )
-        results.sort(key=lambda item: item["score"], reverse=True)
-        return results[:limit]
+            matched = [token for token in unique_tokens if token in search_text]
+            if not matched:
+                continue
+            candidates.append(
+                {
+                    "result_type": "document",
+                    "attachment_id": row["attachment_id"],
+                    "file_name": row["file_name"],
+                    "course_id": row["course_id"],
+                    "course_name": row["course_name"],
+                    "category": row["category"],
+                    "page_start": row["page_start"],
+                    "page_end": row["page_end"],
+                    "text": row["text"],
+                    "score": sum(search_text.count(token) for token in tokens),
+                    "tokens_matched": matched,
+                }
+            )
+
+        full = [c for c in candidates if len(c["tokens_matched"]) == len(unique_tokens)]
+        if full or len(unique_tokens) < 2:
+            # Historical semantics: all tokens required, ordered by score, stable.
+            results = full
+            match_mode = "all"
+            results.sort(key=lambda item: item["score"], reverse=True)
+        else:
+            results = candidates
+            match_mode = "any"
+            results.sort(
+                key=lambda item: (len(item["tokens_matched"]), item["score"]), reverse=True
+            )
+        seen_tokens = {token for c in candidates for token in c["tokens_matched"]}
+        return {
+            "results": results[:limit],
+            "match_mode": match_mode,
+            "tokens": unique_tokens,
+            "tokens_unmatched": [token for token in unique_tokens if token not in seen_tokens],
+        }
 
     def read_document(
         self,
@@ -783,9 +833,10 @@ class Repository:
         limit: int = 12,
         max_chars: int = 20000,
     ) -> dict[str, Any]:
-        results = self.search_course_content(
+        search = self.search_course_content_detail(
             query, course_id=course_id, limit=max(limit * 2, limit)
         )
+        results = search["results"]
         evidence = []
         used = 0
         for result in results:
@@ -812,16 +863,32 @@ class Repository:
             remaining = max_chars - used
             if len(text) > remaining:
                 text = text[:remaining]
-            evidence.append({"kind": kind, "text": text, "citation": citation})
+            evidence.append(
+                {
+                    "kind": kind,
+                    "text": text,
+                    "citation": citation,
+                    "tokens_matched": result["tokens_matched"],
+                }
+            )
             used += len(text)
         course = self.conn.execute("SELECT * FROM courses WHERE id=?", (course_id,)).fetchone()
+        note = "Evidence pack only; the MCP client should summarize while retaining citations."
+        if search["match_mode"] == "any":
+            note += (
+                " match_mode=any: no passage contains every query token; evidence is"
+                " ranked by the number of tokens matched (see tokens_matched)."
+            )
         return {
             "query": query,
             "course": self._public_course(course) if course else None,
             "evidence": evidence,
             "returned_chars": used,
             "truncated": len(results) > len(evidence),
-            "note": "Evidence pack only; the MCP client should summarize while retaining citations.",
+            "match_mode": search["match_mode"],
+            "tokens": search["tokens"],
+            "tokens_unmatched": search["tokens_unmatched"],
+            "note": note,
         }
 
     def export_materials(
