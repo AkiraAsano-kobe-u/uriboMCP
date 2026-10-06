@@ -943,3 +943,46 @@ def test_open_moodle_waits_for_shibboleth_chain_before_login(tmp_path: Path, mon
     with pytest.raises(AuthenticationRequired):
         live.open_moodle(settings, base_url=BASE, driver_factory=StuckDriver, login=login)
     assert len(logins) == 1  # never submitted when KNOSSOS was not reached
+
+
+def test_beef_schedule_also_runs_moodle_when_enabled(tmp_path: Path, monkeypatch) -> None:
+    from dataclasses import replace
+
+    from uribo_mcp import sync as sync_module
+
+    calls = []
+    monkeypatch.setattr(sync_module, "_sync_beef", lambda s, course_ids=None: calls.append("beef") or {})
+    monkeypatch.setattr(sync_module, "_sync_moodle", lambda s, course_ids=None: calls.append("moodle") or {})
+    monkeypatch.setattr(sync_module.time, "sleep", lambda seconds: None)
+    settings = load_settings(root=tmp_path)
+    off = replace(settings, sync=replace(settings.sync, enabled_sources=("beef",)))
+    sync_module.synchronize(off, scope="beef")
+    assert calls == ["beef"]
+    calls.clear()
+    on = replace(settings, sync=replace(settings.sync, enabled_sources=("beef", "moodle")))
+    results = sync_module.synchronize(on, scope="beef")
+    assert calls == ["beef", "moodle"] and results["moodle"]["status"] == "ok"
+
+
+def test_mcp_course_lookup_finds_moodle_content(tmp_path: Path) -> None:
+    from uribo_mcp.server import tool_get_deadlines
+
+    settings = load_settings(root=tmp_path)
+    beef = _beef(settings)
+    _sync(settings, FakeMoodleClient())
+    with database(settings.paths.db_path) as conn:
+        repo = Repository(conn)
+        course = repo.find_course("システムモデル")
+        assert course["id"] == beef.id  # the row holding the linked Moodle items
+        titles = {i["title"] for i in repo.list_course_content(course["id"])}
+        assert {"第1回講義資料", "第1回 小テスト", "レポート1"} <= titles
+        from uribo_mcp.legacy import webdata
+
+        links = webdata.get_course_related(conn, ["システムモデル"])["course_links"]
+        assert any(link.get("lms") == "BEEF (Moodle)" for link in links)
+    from datetime import datetime
+
+    from uribo_mcp.server import JST
+
+    due = tool_get_deadlines(settings, date_from="2026-10-01", date_to="2026-10-31", now=datetime(2026, 10, 5, tzinfo=JST))
+    assert {(d["source"], d["title"]) for d in due["deadlines"]} >= {("moodle", "第1回 小テスト"), ("moodle", "レポート1")}

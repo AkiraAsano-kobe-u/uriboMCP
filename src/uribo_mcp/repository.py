@@ -499,14 +499,16 @@ class Repository:
             row = self.conn.execute("SELECT * FROM courses WHERE id=?", (int(query),)).fetchone()
             return self._public_course(row) if row else None
         exact = self.conn.execute(
-            "SELECT * FROM courses WHERE idnumber=? OR course_name=? ORDER BY available DESC LIMIT 1",
+            "SELECT * FROM courses WHERE idnumber=? OR course_name=? "
+            "ORDER BY available DESC, (source='moodle') ASC, id LIMIT 1",
             (str(query), str(query)),
         ).fetchone()
         if exact:
             return self._public_course(exact)
         needle = normalize_search(str(query))
         for row in self.conn.execute(
-            "SELECT * FROM courses ORDER BY available DESC, academic_year DESC"
+            "SELECT * FROM courses ORDER BY available DESC, academic_year DESC, "
+            "(source='moodle') ASC, id"
         ):
             if needle in normalize_search(f"{row['course_code'] or ''} {row['course_name']}"):
                 return self._public_course(row)

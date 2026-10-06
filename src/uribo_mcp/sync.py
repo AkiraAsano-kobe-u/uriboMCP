@@ -294,6 +294,10 @@ def synchronize(
         if scope == "all"
         else ["beef"] if scope == "courses" else [scope]
     )
+    # The frequent "beef" schedule covers both LMSs once Moodle is enabled, so
+    # course material and deadlines from LMS BEEF (Moodle) stay as fresh as BEEF+.
+    if scope == "beef" and "moodle" in settings.sync.enabled_sources:
+        requested.append("moodle")
     if scope == "all" and "beef" not in requested:
         requested.append("beef")
     results: dict[str, Any] = {}
