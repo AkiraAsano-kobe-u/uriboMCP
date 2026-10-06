@@ -1184,3 +1184,60 @@ def test_mcp_course_lookup_finds_moodle_content(tmp_path: Path) -> None:
 
     due = tool_get_deadlines(settings, date_from="2026-10-01", date_to="2026-10-31", now=datetime(2026, 10, 5, tzinfo=JST))
     assert {(d["source"], d["title"]) for d in due["deadlines"]} >= {("moodle", "第1回 小テスト"), ("moodle", "レポート1")}
+
+
+def test_partial_course_name_resolves_to_row_with_moodle_items(tmp_path: Path) -> None:
+    settings = load_settings(root=tmp_path)
+    beef = _beef(settings)
+    _sync(settings, FakeMoodleClient())
+    with database(settings.paths.db_path) as conn:
+        repo = Repository(conn)
+        for query in ("システム", "モデル", "3X004"):
+            assert repo.find_course(query)["id"] == beef.id, query
+
+
+def test_beefplus_idnumber_selects_moodle_course(tmp_path: Path) -> None:
+    settings = load_settings(root=tmp_path)
+    result = _sync(settings, FakeMoodleClient(), course_ids=["20263X0042001"])
+    assert list(result["courses"]) == ["2026_3X004"]
+
+
+def test_errorbox_vetoes_page_with_sections() -> None:
+    html = COURSE_HTML + '<div class="errorbox" data-rel="fatalerror">エラー</div>'
+    assert parse_course_page(COURSE_HTML, base_url=BASE)["is_course_page"] is True
+    assert parse_course_page(html, base_url=BASE)["is_course_page"] is False
+
+
+def test_missing_credentials_fail_before_any_sso_page(moodle_live, monkeypatch) -> None:
+    from uribo_mcp.errors import AuthenticationRequired
+
+    live, settings = moodle_live
+
+    def no_credentials():
+        raise AuthenticationRequired("not configured")
+
+    monkeypatch.setattr(live, "load_credentials", no_credentials)
+    with pytest.raises(AuthenticationRequired):
+        live.open_moodle(settings, base_url=BASE, driver_factory=lambda: pytest.fail("browser opened"))
+
+    class Recorder:
+        current_url = ""
+        def get(self, url):
+            pytest.fail("SSO page opened before credentials were checked")
+
+    with pytest.raises(AuthenticationRequired):
+        live._login_once(Recorder(), "https://beefplus.center.kobe-u.ac.jp/saml/login", "beefplus.center.kobe-u.ac.jp")
+
+
+def test_submit_form_rejects_unexpected_final_host() -> None:
+    from uribo_mcp import live
+    from uribo_mcp.auth import KobeCredentials
+    from uribo_mcp.errors import AuthenticationRequired
+
+    def to_other_host(d):
+        d.current_url = "https://example.kobe-u.ac.jp/landing"
+
+    driver = _SelDriver(to_other_host)
+    with pytest.raises(AuthenticationRequired):
+        live._submit_knossos_form(driver, "beefplus.center.kobe-u.ac.jp", KobeCredentials("u", "p"))
+    assert driver.clicks == 1

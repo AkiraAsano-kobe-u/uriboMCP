@@ -504,15 +504,27 @@ class Repository:
             (str(query), str(query)),
         ).fetchone()
         if exact:
-            return self._public_course(exact)
+            return self._linked_course(exact)
         needle = normalize_search(str(query))
         for row in self.conn.execute(
-            "SELECT * FROM courses ORDER BY available DESC, academic_year DESC, "
-            "(source='moodle') ASC, id"
+            "SELECT * FROM courses ORDER BY available DESC, (source='moodle') ASC, "
+            "academic_year DESC, id"
         ):
             if needle in normalize_search(f"{row['course_code'] or ''} {row['course_name']}"):
-                return self._public_course(row)
+                return self._linked_course(row)
         return None
+
+    def _linked_course(self, row: sqlite3.Row) -> dict[str, Any]:
+        """A Moodle anchor row linked to BEEF+ resolves to the row holding its items."""
+        course = self._public_course(row)
+        linked = (course.get("metadata") or {}).get("linked_beef_course_id")
+        if row["source"] == "moodle" and linked:
+            target = self.conn.execute(
+                "SELECT * FROM courses WHERE id=? AND available=1", (int(linked),)
+            ).fetchone()
+            if target:
+                return self._public_course(target)
+        return course
 
     def list_course_content(
         self,

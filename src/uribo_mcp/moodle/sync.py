@@ -129,6 +129,12 @@ class MoodleSynchronizer:
             for raw in self.client.enrolled_courses()
         ]
         wanted = set(course_ids or [])
+        # scope=beef passes BEEF+ idnumbers (<year><code><4 digits>); match by code.
+        wanted |= {
+            match.group(1)
+            for value in wanted.copy()
+            if (match := re.match(r"^\d{4}([0-9][A-Z][0-9A-Z]{3})\d{4}$", value))
+        }
         events: list[dict[str, Any]] = []
         calendar_ok = True
         for year, month in _month_window(self.today):

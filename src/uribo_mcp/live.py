@@ -161,10 +161,14 @@ def authenticated_lms(
         restored = _inject_vault(driver, vault, source, base_url)
         if restored:
             driver.get(landing)
-        if not restored or expected_host not in driver.current_url or "/login" in driver.current_url:
+        if (
+            not restored
+            or urlparse(driver.current_url).hostname != expected_host
+            or "/login" in driver.current_url
+        ):
             _login_once(driver, base_url.rstrip("/") + "/saml/login?disco=true", expected_host)
             driver.get(landing)
-        if expected_host not in driver.current_url or "knossos" in driver.current_url:
+        if urlparse(driver.current_url).hostname != expected_host:
             raise AuthenticationRequired(f"Could not open authenticated LMS page: {landing}")
         vault.save(source, driver.get_cookies())
         session = _requests_from_driver(driver)
