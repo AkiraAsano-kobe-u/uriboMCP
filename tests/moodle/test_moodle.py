@@ -481,10 +481,12 @@ def test_calendar_deadline_priority() -> None:
         {"url": f"{BASE}/mod/attendance/view.php?id=8", "eventtype": "session", "timestart": 1792076340},
     ]
     mapping = calendar_deadlines(events)
-    assert mapping["7"] == {"deadline": "2026-10-15T23:59"}
+    assert mapping["7"] == {"deadline": "2026-10-15T23:59", "expected_completion": "2026-10-26T16:33"}
     assert "deadline" not in mapping.get("8", {})
     later = calendar_deadlines([events[1], events[0]])
     assert later["7"]["deadline"] == "2026-10-15T23:59"
+    only_expected = calendar_deadlines([events[1]])
+    assert "deadline" not in only_expected["7"]
     assert calendar_deadlines(EVENTS)["102"] == {
         "deadline": "2026-10-15T23:59",
         "available_from": "2026-10-05T14:40",
@@ -511,6 +513,10 @@ def test_activity_page_reads_deadline_only_from_dates_and_status_table() -> None
 def test_forum_listing_reports_pagination() -> None:
     listing = parse_forum_discussions(FORUM_HTML, base_url=BASE)
     assert [d["title"] for d in listing["discussions"]] == ["休講のお知らせ"] and not listing["paged"]
+    assert listing["recognized"]
+    empty = '<div id="region-main"><div class="forumnodiscuss alert">(まだ投稿はありません)</div></div>'
+    assert parse_forum_discussions(empty, base_url=BASE) == {"discussions": [], "paged": False, "recognized": True}
+    assert not parse_forum_discussions('<div id="region-main"><p>?</p></div>', base_url=BASE)["recognized"]
     paged = FORUM_HTML.replace("</div>", '<nav class="pagination"><a href="?id=1&page=1">2</a></nav></div>')
     assert parse_forum_discussions(paged, base_url=BASE)["paged"]
 
@@ -735,3 +741,150 @@ def test_course_ids_filter_skips_other_courses_and_unenrolment(tmp_path: Path) -
     result = _sync(settings, FakeMoodleClient(enrolled=[]), course_ids=["2026_3X004"])
     assert result["courses"] == {} and result["courses_unavailable"] == 0
     assert all(row["available"] == 1 for row in _rows(settings).values())
+
+
+# ------------------------------------------------- second review regressions
+def test_live_empty_forum_is_recognised_and_discussion_chrome_is_not_a_body() -> None:
+    from uribo_mcp.moodle.parser import parse_forum_discussion
+
+    sample = Path("/Users/asanoakira/.hermes/cache/scratch/beefbeef/forum_16327.html")
+    if sample.exists():
+        html = sample.read_text(encoding="utf-8")
+        assert parse_forum_discussions(html, base_url=BASE)["recognized"]
+        assert parse_forum_discussion(html, base_url=BASE)["body"] is None
+    chrome = '<nav><div class="content">Home ダッシュボード マイコース</div></nav>'
+    assert parse_forum_discussion(chrome, base_url=BASE) == {
+        "body": None, "published_at": None, "files": [], "recognized": False
+    }
+
+
+def test_calendar_failure_or_window_keeps_known_deadlines(tmp_path: Path) -> None:
+    settings = load_settings(root=tmp_path)
+    _sync(settings, FakeMoodleClient())
+
+    class NoCalendar(FakeMoodleClient):
+        def calendar_month(self, year, month):
+            raise ConnectionError("calendar down")
+
+    result = _sync(settings, NoCalendar())
+    assert result["calendar_complete"] is False
+    assert _rows(settings)["test/2026_3X004/102"]["deadline"] == "2026-10-15T23:59"
+    with database(settings.paths.db_path) as conn:  # calendar moved out of the window
+        later = MoodleSynchronizer(
+            settings=settings, repository=Repository(conn), client=FakeMoodleClient(), today=date(2027, 1, 5)
+        ).run()
+    assert later["calendar_events"] == 0
+    assert _rows(settings)["test/2026_3X004/102"]["deadline"] == "2026-10-15T23:59"
+
+
+def test_expected_completion_never_overrides_page_deadline(tmp_path: Path, monkeypatch) -> None:
+    settings = load_settings(root=tmp_path)
+    expected_only = [{"url": f"{BASE}/mod/assign/view.php?id=104", "eventtype": "expectcompletionon", "timestart": 1791900000}]
+    monkeypatch.setattr(FakeMoodleClient, "calendar_month", lambda self, y, m: expected_only if (y, m) == (2026, 10) else [])
+    _sync(settings, FakeMoodleClient())
+    row = _rows(settings)["assignment/2026_3X004/104"]
+    assert row["deadline"] == "2026-10-19T23:59"
+    assert json.loads(row["metadata_json"])["expected_completion"] == "2026-10-13T23:00"
+
+
+def test_http200_error_page_hides_nothing(tmp_path: Path) -> None:
+    settings = load_settings(root=tmp_path)
+    _sync(settings, FakeMoodleClient())
+    error_page = '<body id="page-error"><div class="errorbox">メンテナンス中</div></body>'
+    result = _sync(settings, FakeMoodleClient(error_page))
+    assert result["courses"]["2026_3X004"]["status"] == "error"
+    assert all(row["available"] == 1 for row in _rows(settings).values())
+
+
+def test_unrecognised_forum_or_discussion_keeps_announcements(tmp_path: Path, monkeypatch) -> None:
+    settings = load_settings(root=tmp_path)
+    _sync(settings, FakeMoodleClient())
+    original = FakeMoodleClient.fetch_page
+
+    def odd_forum(self, url, *, params=None):
+        if "/mod/forum/view.php" in url:
+            return '<div id="region-main"><p>new layout</p></div>'
+        return original(self, url, params=params)
+
+    monkeypatch.setattr(FakeMoodleClient, "fetch_page", odd_forum)
+    _sync(settings, FakeMoodleClient())
+    row = _rows(settings)["announcement/2026_3X004/d55"]
+    assert row["available"] == 1 and row["body"] == "10月12日は休講です。"
+
+    def odd_discussion(self, url, *, params=None):
+        if "/mod/forum/discuss.php" in url:
+            return '<nav><div class="content">Home ダッシュボード</div></nav>'
+        return original(self, url, params=params)
+
+    monkeypatch.setattr(FakeMoodleClient, "fetch_page", odd_discussion)
+    _sync(settings, FakeMoodleClient())
+    assert _rows(settings)["announcement/2026_3X004/d55"]["body"] == "10月12日は休講です。"
+
+
+@pytest.mark.parametrize("variant", ["paged", "truncated"])
+def test_partial_forum_listing_keeps_unseen_announcements(tmp_path: Path, monkeypatch, variant) -> None:
+    settings = load_settings(root=tmp_path)
+    _sync(settings, FakeMoodleClient())
+    original = FakeMoodleClient.fetch_page
+    if variant == "paged":
+        listing = FORUM_HTML.replace("d=55", "d=56").replace(
+            "</div>", '<nav class="pagination"><a href="?id=900&page=1">2</a></nav></div>'
+        )
+    else:
+        rows = "".join(
+            f'<tr><th><a href="{BASE}/mod/forum/discuss.php?d={n}">告知{n}</a></th></tr>'
+            for n in range(100, 131)
+        )
+        listing = f'<div id="region-main"><table>{rows}</table></div>'
+
+    def forum(self, url, *, params=None):
+        if "/mod/forum/view.php" in url:
+            return listing
+        return original(self, url, params=params)
+
+    monkeypatch.setattr(FakeMoodleClient, "fetch_page", forum)
+    _sync(settings, FakeMoodleClient())
+    assert _rows(settings)["announcement/2026_3X004/d55"]["available"] == 1
+
+
+def test_allowlist_refusal_fails_one_activity_not_the_source(tmp_path: Path) -> None:
+    settings = load_settings(root=tmp_path)
+    _sync(settings, FakeMoodleClient())
+
+    class Refusing(FakeMoodleClient):
+        def resolve_resource_file(self, cmid):
+            if str(cmid) == "101":
+                raise PermissionError("Endpoint is outside the read-only allowlist: /enrol/index.php")
+            return super().resolve_resource_file(cmid)
+
+    result = _sync(settings, Refusing())["courses"]["2026_3X004"]
+    assert result["items_kept_after_error"] == 1 and result["items_unavailable"] == 0
+    assert all(row["available"] == 1 for row in _rows(settings).values())
+
+
+def test_failed_sso_skips_later_sso_sources(tmp_path: Path, monkeypatch) -> None:
+    from uribo_mcp import sync as sync_module
+    from uribo_mcp.errors import AuthenticationRequired
+
+    settings = load_settings(root=tmp_path)
+    calls = []
+
+    def beef(settings, course_ids=None):
+        calls.append("beef")
+        raise AuthenticationRequired("KNOSSOS login failed")
+
+    def moodle(settings, course_ids=None):
+        calls.append("moodle")
+        return {}
+
+    monkeypatch.setattr(sync_module, "_sync_beef", beef)
+    monkeypatch.setattr(sync_module, "_sync_moodle", moodle)
+    monkeypatch.setattr(sync_module, "_sync_csi", lambda settings: calls.append("csi") or {})
+    monkeypatch.setattr(sync_module.time, "sleep", lambda seconds: None)
+    from dataclasses import replace
+
+    settings = replace(settings, sync=replace(settings.sync, enabled_sources=("beef", "csi", "moodle")))
+    results = sync_module.synchronize(settings, scope="all")
+    assert calls == ["beef", "csi"]
+    assert results["moodle"]["status"] == "skipped"
+    assert results["csi"]["status"] == "ok"

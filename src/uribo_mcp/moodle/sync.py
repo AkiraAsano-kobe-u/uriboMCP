@@ -7,8 +7,15 @@ course search covers both LMSs; a ``source='moodle'`` course row is always
 kept as well.
 
 Snapshot rule: a row is only marked unavailable when the page that would list
-it was fetched successfully.  Any transient failure keeps the previous row
-untouched (body, deadline and attachments included).
+it was fetched successfully *and recognised* (an HTTP 200 error page is not a
+course page).  Any transient failure keeps the previous row untouched (body,
+deadline and attachments included).  A known deadline is never blanked just
+because no source mentioned it this time (calendar failure, or an event that
+moved outside the fetched calendar window).
+
+Only ``MoodleSessionExpired`` aborts the whole source.  Other refusals (for
+example a redirect outside the read-only allowlist) fail just that activity or
+course and keep its rows.
 """
 
 from __future__ import annotations
@@ -26,7 +33,7 @@ from urllib.parse import unquote, urlparse
 from uribo_mcp.config import Settings
 from uribo_mcp.ingest import AttachmentIngestor
 from uribo_mcp.models import CourseRecord, ItemRecord
-from uribo_mcp.moodle.client import MoodleReadOnlyClient
+from uribo_mcp.moodle.client import MoodleReadOnlyClient, MoodleSessionExpired
 from uribo_mcp.moodle.parser import (
     CATEGORY_BY_MODULE,
     DETAIL_MODULES,
@@ -126,7 +133,7 @@ class MoodleSynchronizer:
         for year, month in _month_window(self.today):
             try:
                 events.extend(self.client.calendar_month(year, month))
-            except PermissionError:
+            except MoodleSessionExpired:
                 raise
             except Exception as exc:  # deadlines also come from assign pages
                 calendar_ok = False
@@ -140,8 +147,8 @@ class MoodleSynchronizer:
                 continue
             try:
                 results[course["idnumber"]] = self.sync_course(course, deadlines=deadlines)
-            except PermissionError:
-                raise  # session expired: abort the source, keep every snapshot
+            except MoodleSessionExpired:
+                raise  # abort the source, keep every snapshot
             except Exception as exc:
                 LOGGER.warning("Moodle course %s failed: %s", course["idnumber"], exc)
                 results[course["idnumber"]] = {
@@ -183,6 +190,8 @@ class MoodleSynchronizer:
         idnumber = course["idnumber"]
         page = parse_course_page(self.client.fetch_course(course["moodle_id"]), base_url=self.client.base_url)
         self.pause()
+        if not page["is_course_page"]:
+            raise RuntimeError("Moodle returned a page that is not a course page")
         linked = self.linked_course(course)
         anchor = self.repository.upsert_course(
             CourseRecord(
@@ -257,6 +266,12 @@ class MoodleSynchronizer:
                 )
         return missing
 
+    def _stored_deadline(self, source_id: str) -> str | None:
+        row = self.repository.conn.execute(
+            "SELECT deadline FROM items WHERE source=? AND source_id=?", (SOURCE, source_id)
+        ).fetchone()
+        return row["deadline"] if row else None
+
     def _existing_forum_ids(self, idnumber: str, forum_cmid: str) -> list[str]:
         # Prefix match in Python: Moodle idnumbers contain "_", a LIKE wildcard.
         prefix = f"announcement/{idnumber}/"
@@ -302,9 +317,11 @@ class MoodleSynchronizer:
         calendar = deadlines.get(cmid) or {}
         if calendar.get("available_from"):
             draft.metadata["available_from"] = calendar["available_from"]
+        if calendar.get("expected_completion"):
+            draft.metadata["expected_completion"] = calendar["expected_completion"]
         if category in METADATA_ONLY:
             draft.metadata["read_policy"] = "metadata_only"
-            draft.deadline = calendar.get("deadline")
+            draft.deadline = calendar.get("deadline") or self._stored_deadline(draft.source_id)
             return draft
         detail: dict[str, Any] = {}
         try:
@@ -318,7 +335,7 @@ class MoodleSynchronizer:
                     self.client.fetch_page(str(activity["url"])), base_url=self.client.base_url
                 )
                 self.pause()
-        except PermissionError:
+        except MoodleSessionExpired:
             raise
         except Exception as exc:
             LOGGER.warning("Moodle detail fetch failed for cm %s: %s", cmid, exc)
@@ -328,8 +345,13 @@ class MoodleSynchronizer:
         draft.attachments.extend(
             _file_attachment(cmid, link["url"], link["name"]) for link in detail.get("files") or []
         )
-        # Calendar epochs are exact; the page text is the fallback.
-        draft.deadline = calendar.get("deadline") or detail.get("deadline")
+        # Calendar due/close epochs are exact; the page text is the fallback;
+        # a previously stored deadline is kept rather than blanked.
+        draft.deadline = (
+            calendar.get("deadline")
+            or detail.get("deadline")
+            or self._stored_deadline(draft.source_id)
+        )
         for key in ("submission_status", "dates"):
             if detail.get(key):
                 draft.metadata[key] = detail[key]
@@ -344,13 +366,19 @@ class MoodleSynchronizer:
                 self.client.fetch_page(str(activity["url"])), base_url=self.client.base_url
             )
             self.pause()
-        except PermissionError:
+        except MoodleSessionExpired:
             raise
         except Exception as exc:
             LOGGER.warning("Moodle forum %s failed: %s", activity["cmid"], exc)
             return [], False
         discussions = listing["discussions"]
-        complete = not listing["paged"] and len(discussions) <= MAX_DISCUSSIONS_PER_FORUM
+        complete = (
+            listing["recognized"]
+            and not listing["paged"]
+            and len(discussions) <= MAX_DISCUSSIONS_PER_FORUM
+        )
+        if not listing["recognized"]:
+            LOGGER.warning("Moodle forum %s: unrecognised list layout", activity["cmid"])
         drafts: list[_Draft] = []
         for discussion in discussions[:MAX_DISCUSSIONS_PER_FORUM]:
             key = f"d{discussion['discussion_id']}"
@@ -374,12 +402,14 @@ class MoodleSynchronizer:
                     self.client.fetch_page(discussion["url"]), base_url=self.client.base_url
                 )
                 self.pause()
+                if not detail["recognized"]:
+                    raise RuntimeError("unrecognised discussion layout")
                 draft.body = detail.get("body")
                 draft.published_at = detail.get("published_at") or draft.published_at
                 draft.attachments = [
                     _file_attachment(key, link["url"], link["name"]) for link in detail.get("files") or []
                 ]
-            except PermissionError:
+            except MoodleSessionExpired:
                 raise
             except Exception as exc:
                 LOGGER.warning("Moodle discussion %s failed: %s", discussion["discussion_id"], exc)

@@ -38,9 +38,11 @@ DETAIL_MODULES = frozenset({"page", "folder", "assign"})
 
 _SECTION_SELECTOR = "li.section[data-number], li.course-section[data-number]"
 _HIDDEN_SELECTOR = ".accesshide, .sr-only, .visually-hidden, script, style"
-# Calendar event types and their strength.  ``gradingdue`` (the teacher's
-# grading deadline) and unknown types never set a student deadline.
-_DEADLINE_EVENT_RANK = {"due": 3, "close": 3, "expectcompletionon": 1}
+# Calendar event types.  ``expectcompletionon`` is the teacher's planned
+# completion date, not a deadline, so it is reported separately.
+# ``gradingdue`` (the teacher's grading deadline) and unknown types are ignored.
+_DEADLINE_EVENTS = frozenset({"due", "close"})
+_EXPECTED_EVENTS = frozenset({"expectcompletionon"})
 _OPEN_EVENTS = frozenset({"open", "allowsubmissionsfromdate"})
 _DEADLINE_LABEL = re.compile(r"^(?:期限|終了日時|終了|Due|Closes?)$", re.IGNORECASE)
 _STATUS_LABEL = re.compile(r"提出ステータス|Submission status", re.IGNORECASE)
@@ -143,7 +145,10 @@ def _nearest_section(li: Tag) -> Tag | None:
 
 
 def parse_course_page(html: str, *, base_url: str) -> dict[str, Any]:
-    """Return ``{"summary", "activities"}`` from ``course/view.php``.
+    """Return ``{"summary", "activities", "is_course_page"}`` from ``course/view.php``.
+
+    ``is_course_page`` is false for error/maintenance pages served with HTTP
+    200; callers must not treat a missing activity list as deletions then.
 
     Each activity is reported once, under its innermost section, so Moodle 4.5
     subsections (sections nested inside a ``modtype_subsection`` activity) do
@@ -169,7 +174,6 @@ def parse_course_page(html: str, *, base_url: str) -> dict[str, Any]:
         if module == "subsection":
             continue
         section = _nearest_section(li)
-        number = section.get("data-number") if section is not None else None
         section_name = _clean(section.get("data-sectionname")) if section is not None else ""
         link = li.select_one(".activityname a[href], a.aalink[href]")
         href = urljoin(base_url + "/", str(link["href"]).strip()) if link else None
@@ -190,14 +194,22 @@ def parse_course_page(html: str, *, base_url: str) -> dict[str, Any]:
                 "url": href,
                 "body": body,
                 "file_type": _text(li.select_one(".activitybadge")) or None,
-                "section_number": int(number) if number and str(number).isdigit() else None,
                 "section_name": section_name or None,
                 "inline_files": pluginfile_links(content_el, base_url=base_url)
                 if content_el
                 else [],
             }
         )
-    return {"summary": "\n".join(summary_parts) or None, "activities": activities}
+    body = soup.select_one("body")
+    is_course_page = bool(
+        str(body.get("id") if body else "").startswith("page-course-view")
+        or soup.select_one(_SECTION_SELECTOR)
+    )
+    return {
+        "summary": "\n".join(summary_parts) or None,
+        "activities": activities,
+        "is_course_page": is_course_page,
+    }
 
 
 def parse_activity_page(html: str, *, base_url: str) -> dict[str, Any]:
@@ -263,8 +275,9 @@ def parse_forum_discussions(html: str, *, base_url: str) -> dict[str, Any]:
 
     NOTE: the live BEEF forums had no posts when this was written, so these
     selectors are not yet verified against real content.  ``paged`` is true
-    when the list continues on another page; the caller must then not treat
-    unseen discussions as deleted.
+    when the list continues on another page and ``recognized`` is false for an
+    unknown layout; in either case the caller must not treat unseen
+    discussions as deleted.
     """
     soup = BeautifulSoup(html or "", "html.parser")
     main = soup.select_one("#region-main") or soup
@@ -291,22 +304,26 @@ def parse_forum_discussions(html: str, *, base_url: str) -> dict[str, Any]:
                 "published_at": epoch_to_iso(stamp.get("data-timestamp")) if stamp else None,
             }
         )
+    # Only a list we positively recognise may be used to detect deletions:
+    # at least one discussion, or Moodle's explicit "no discussions" notice.
+    recognized = bool(discussions) or main.select_one(".forumnodiscuss") is not None
     paged = bool(
         main.select_one("nav.pagination, ul.pagination, [data-region='pagination']")
         or main.select_one("a[href*='/mod/forum/view.php'][href*='page=']")
     )
-    return {"discussions": discussions, "paged": paged}
+    return {"discussions": discussions, "paged": paged, "recognized": recognized}
 
 
 def parse_forum_discussion(html: str, *, base_url: str) -> dict[str, Any]:
     """First post of ``mod/forum/discuss.php`` (selectors not yet live-verified)."""
     soup = BeautifulSoup(html or "", "html.parser")
     post = soup.select_one("[data-region='post'], .forumpost")
-    scope = post or soup
-    body_el = scope.select_one(
-        "[data-region-content='forum-post-core'], .post-content-container, .content"
+    if post is None:  # unknown layout: never fall back to page chrome
+        return {"body": None, "published_at": None, "files": [], "recognized": False}
+    body_el = post.select_one(
+        "[data-region-content='forum-post-core'], .post-content-container, .posting"
     )
-    stamp = scope.select_one("time[datetime]")
+    stamp = post.select_one("time[datetime]")
     published = None
     if stamp is not None:
         try:
@@ -321,18 +338,18 @@ def parse_forum_discussion(html: str, *, base_url: str) -> dict[str, Any]:
     return {
         "body": _multiline(body_el),
         "published_at": published,
-        "files": pluginfile_links(post, base_url=base_url) if post else [],
+        "files": pluginfile_links(post, base_url=base_url),
+        "recognized": body_el is not None,
     }
 
 
 def calendar_deadlines(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Map course-module id -> {deadline, available_from} from calendar events.
+    """Map course-module id -> {deadline, available_from, expected_completion}.
 
-    ``due``/``close`` win over ``expectcompletionon`` regardless of order;
-    ``gradingdue`` and unknown event types never set a deadline.
+    Only ``due``/``close`` set ``deadline``; ``expectcompletionon`` goes to
+    ``expected_completion`` so it can never outrank a real deadline.
     """
     out: dict[str, dict[str, Any]] = {}
-    ranks: dict[str, int] = {}
     for event in events:
         url = str(event.get("url") or "")
         if "/mod/" not in url:
@@ -345,10 +362,10 @@ def calendar_deadlines(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]
         if kind in _OPEN_EVENTS:
             out.setdefault(cmid, {})["available_from"] = when
             continue
-        rank = _DEADLINE_EVENT_RANK.get(kind, 0)
-        if rank and rank >= ranks.get(cmid, 0):
+        if kind in _DEADLINE_EVENTS:
             out.setdefault(cmid, {})["deadline"] = when
-            ranks[cmid] = rank
+        elif kind in _EXPECTED_EVENTS:
+            out.setdefault(cmid, {})["expected_completion"] = when
     return out
 
 
