@@ -67,7 +67,7 @@ def _public_legacy(item: dict[str, Any], *, include_body: bool = False) -> dict[
 
 def tool_get_today(settings: Settings, now: datetime | None = None) -> dict[str, Any]:
     now = now or datetime.now(JST)
-    with database(settings.paths.db_path) as conn:
+    with database(settings.paths.db_path, readonly=True) as conn:
         timetable = webdata.get_timetable_today(conn, now)
         actions = [_public_legacy(item) for item in webdata.get_actions(conn)]
     due_today = []
@@ -115,7 +115,7 @@ def tool_get_deadlines(
         if days_ahead is not None
         else None
     )
-    with database(settings.paths.db_path) as conn:
+    with database(settings.paths.db_path, readonly=True) as conn:
         rows = conn.execute(
             "SELECT * FROM items WHERE deadline IS NOT NULL AND deadline<>''"
         ).fetchall()
@@ -158,7 +158,7 @@ def tool_search_items(
         where.append("is_read=0")
     needle = normalize_search(query)
     output = []
-    with database(settings.paths.db_path) as conn:
+    with database(settings.paths.db_path, readonly=True) as conn:
         rows = conn.execute(
             f"SELECT * FROM items WHERE {' AND '.join(where)} "
             "ORDER BY COALESCE(published_at, updated_at) DESC, id DESC",
@@ -262,7 +262,7 @@ def build_server(settings: Settings | None = None):
     def get_unread(limit: int = 20) -> dict[str, Any]:
         """未読項目を重要度優先で返す。"""
         rank = {"action_required": 0, "relevant": 1, "info": 2, "uncat": 3}
-        with database(settings.paths.db_path) as conn:
+        with database(settings.paths.db_path, readonly=True) as conn:
             items = [item for item in webdata.get_inbox(conn) if not item["is_read"]]
         items.sort(key=lambda item: str(item.get("published_at") or ""), reverse=True)
         items.sort(key=lambda item: rank.get(item["importance"], 9))
@@ -274,7 +274,7 @@ def build_server(settings: Settings | None = None):
         course_name: str | None = None, limit: int = 50
     ) -> dict[str, Any]:
         """保存済みの授業メモを返す。"""
-        with database(settings.paths.db_path) as conn:
+        with database(settings.paths.db_path, readonly=True) as conn:
             notes = (
                 webdata.get_course_notes(conn, [course_name])
                 if course_name
@@ -286,7 +286,7 @@ def build_server(settings: Settings | None = None):
     @server.tool(annotations=read_only)
     def get_news(limit: int = 20) -> dict[str, Any]:
         """神戸大学ニュースネットの記事を返す。"""
-        with database(settings.paths.db_path) as conn:
+        with database(settings.paths.db_path, readonly=True) as conn:
             rows = conn.execute(
                 """SELECT * FROM items WHERE source='newsnet' AND available=1
                    ORDER BY published_at DESC, id DESC LIMIT ?""",
@@ -298,14 +298,14 @@ def build_server(settings: Settings | None = None):
     @server.tool(annotations=read_only)
     def get_item(item_id: int) -> dict[str, Any]:
         """項目本文と添付一覧を返す。"""
-        with database(settings.paths.db_path) as conn:
+        with database(settings.paths.db_path, readonly=True) as conn:
             item = Repository(conn).get_item(item_id)
         return {"found": bool(item), "item": item}
 
     @server.tool(annotations=read_only)
     def get_week() -> dict[str, Any]:
         """今週（月〜土）の時間割を返す。"""
-        with database(settings.paths.db_path) as conn:
+        with database(settings.paths.db_path, readonly=True) as conn:
             return webdata.get_timetable_week(conn, datetime.now(JST))
 
     @server.tool(annotations=read_only)
@@ -313,7 +313,7 @@ def build_server(settings: Settings | None = None):
         course_name: str, announcement_limit: int = 10
     ) -> dict[str, Any]:
         """指定授業の要対応、お知らせ、メモ、LMSリンクを返す。"""
-        with database(settings.paths.db_path) as conn:
+        with database(settings.paths.db_path, readonly=True) as conn:
             result = webdata.get_course_related(
                 conn,
                 [course_name],
@@ -330,7 +330,7 @@ def build_server(settings: Settings | None = None):
     @server.tool(annotations=read_only)
     def get_source_health() -> dict[str, Any]:
         """ソースごとの直近同期結果を返す。"""
-        with database(settings.paths.db_path) as conn:
+        with database(settings.paths.db_path, readonly=True) as conn:
             sources = webdata.get_source_health(conn)
         return {
             "as_of_utc": datetime.now(UTC).isoformat(),
@@ -341,7 +341,7 @@ def build_server(settings: Settings | None = None):
     @server.tool(annotations=read_only)
     def list_courses(available_only: bool = True) -> dict[str, Any]:
         """同期済みの授業一覧を返す。"""
-        with database(settings.paths.db_path) as conn:
+        with database(settings.paths.db_path, readonly=True) as conn:
             courses = Repository(conn).list_courses(available_only=available_only)
         return {"count": len(courses), "courses": courses}
 
@@ -353,7 +353,7 @@ def build_server(settings: Settings | None = None):
         limit: int = 100,
     ) -> dict[str, Any]:
         """授業内の教材・お知らせ・課題・テスト等のメタデータ一覧を返す。"""
-        with database(settings.paths.db_path) as conn:
+        with database(settings.paths.db_path, readonly=True) as conn:
             repository = Repository(conn)
             resolved = _resolve_course(repository, course)
             if not resolved["found"]:
@@ -369,7 +369,7 @@ def build_server(settings: Settings | None = None):
     @server.tool(annotations=read_only)
     def get_course_content(item_id: int) -> dict[str, Any]:
         """授業コンテンツ1件の本文・期限・状態・添付を返す。"""
-        with database(settings.paths.db_path) as conn:
+        with database(settings.paths.db_path, readonly=True) as conn:
             item = Repository(conn).get_item(item_id)
         return {"found": bool(item), "item": item}
 
@@ -381,7 +381,7 @@ def build_server(settings: Settings | None = None):
         limit: int = 20,
     ) -> dict[str, Any]:
         """授業本文と抽出済みPDF／Office文書を横断検索する。"""
-        with database(settings.paths.db_path) as conn:
+        with database(settings.paths.db_path, readonly=True) as conn:
             repository = Repository(conn)
             course_id = None
             selected = None
@@ -415,7 +415,7 @@ def build_server(settings: Settings | None = None):
             max(1, int(max_chars or settings.mcp.max_text_chars)),
             settings.mcp.max_text_chars,
         )
-        with database(settings.paths.db_path) as conn:
+        with database(settings.paths.db_path, readonly=True) as conn:
             return Repository(conn).read_document(
                 attachment_id,
                 page_from=page_from,
@@ -430,7 +430,7 @@ def build_server(settings: Settings | None = None):
         limit: int = 100,
     ) -> dict[str, Any]:
         """新規・更新・非公開化された授業コンテンツの履歴を返す。"""
-        with database(settings.paths.db_path) as conn:
+        with database(settings.paths.db_path, readonly=True) as conn:
             repository = Repository(conn)
             course_id = None
             if course:
@@ -450,7 +450,7 @@ def build_server(settings: Settings | None = None):
         acknowledged: bool | None = False, limit: int = 100
     ) -> dict[str, Any]:
         """教材・お知らせ・課題等の更新通知を返す。"""
-        with database(settings.paths.db_path) as conn:
+        with database(settings.paths.db_path, readonly=True) as conn:
             notifications = Repository(conn).get_notifications(
                 acknowledged=acknowledged,
                 limit=_limit(settings, limit),
@@ -472,7 +472,7 @@ def build_server(settings: Settings | None = None):
         max_chars: int = 20000,
     ) -> dict[str, Any]:
         """授業内検索から、ページ引用つきの学習用根拠パックを構築する。"""
-        with database(settings.paths.db_path) as conn:
+        with database(settings.paths.db_path, readonly=True) as conn:
             repository = Repository(conn)
             selected = repository.find_course(course)
             if not selected:

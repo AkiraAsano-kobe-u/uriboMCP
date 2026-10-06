@@ -95,7 +95,7 @@ def _job_row(conn, job_id: str) -> dict[str, Any] | None:
 
 
 def get_refresh_status(settings: Settings, job_id: str | None = None) -> dict[str, Any]:
-    with database(settings.paths.db_path) as conn:
+    with database(settings.paths.db_path, readonly=True) as conn:
         if job_id:
             job = _job_row(conn, job_id)
             return {"found": bool(job), "job": job}

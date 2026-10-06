@@ -232,6 +232,9 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 
 SCHEMA_VERSION = 1
 
+# Readers never wait on the WAL writer, so a short timeout only bounds abnormal cases.
+READ_BUSY_TIMEOUT_S = 5
+
 
 def connect(path: str | Path) -> sqlite3.Connection:
     """Open a concurrency-friendly connection for desktop clients."""
@@ -243,6 +246,36 @@ def connect(path: str | Path) -> sqlite3.Connection:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
     return conn
+
+
+def connect_readonly(path: str | Path) -> sqlite3.Connection:
+    """Open a read-only connection that can never take the write lock.
+
+    ``query_only`` turns any accidental write into ``sqlite3.OperationalError``.
+    No ``journal_mode``/``synchronous`` pragmas are issued: those are writer
+    concerns and the former needs a lock when the mode would change.
+    """
+    conn = sqlite3.connect(str(path), timeout=READ_BUSY_TIMEOUT_S)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only = 1")
+    conn.execute(f"PRAGMA busy_timeout = {READ_BUSY_TIMEOUT_S * 1000}")
+    return conn
+
+
+def schema_version(conn: sqlite3.Connection) -> int | None:
+    """Return the stored schema version, or ``None`` when the DB is uninitialized."""
+    try:
+        row = conn.execute(
+            "SELECT value FROM schema_meta WHERE key='schema_version'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row is None:
+        return None
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return None
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -300,25 +333,50 @@ def initialize(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "task_snapshot", "source", "source TEXT NOT NULL DEFAULT 'beef'")
     _ensure_column(conn, "sync_jobs", "result_json", "result_json TEXT")
 
-    conn.execute(
-        "UPDATE items SET first_seen_at = COALESCE(first_seen_at, created_at, datetime('now'))"
-    )
-    conn.execute(
-        "UPDATE items SET last_seen_at = COALESCE(last_seen_at, created_at, datetime('now'))"
-    )
-    conn.execute(
-        "UPDATE items SET updated_at = COALESCE(updated_at, created_at, datetime('now'))"
-    )
-    conn.execute(
-        "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (str(SCHEMA_VERSION),),
-    )
+    # Writes below are guarded by SELECTs: even a zero-row UPDATE or a same-value
+    # upsert takes the RESERVED lock and would wait on a running sync job.
+    needs_backfill = conn.execute(
+        "SELECT 1 FROM items WHERE first_seen_at IS NULL OR last_seen_at IS NULL "
+        "OR updated_at IS NULL LIMIT 1"
+    ).fetchone()
+    if needs_backfill is not None:
+        conn.execute(
+            "UPDATE items SET first_seen_at = COALESCE(first_seen_at, created_at, datetime('now'))"
+        )
+        conn.execute(
+            "UPDATE items SET last_seen_at = COALESCE(last_seen_at, created_at, datetime('now'))"
+        )
+        conn.execute(
+            "UPDATE items SET updated_at = COALESCE(updated_at, created_at, datetime('now'))"
+        )
+    if schema_version(conn) != SCHEMA_VERSION:
+        conn.execute(
+            "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(SCHEMA_VERSION),),
+        )
     conn.commit()
 
 
 @contextmanager
-def database(path: str | Path) -> Iterator[sqlite3.Connection]:
+def database(path: str | Path, *, readonly: bool = False) -> Iterator[sqlite3.Connection]:
+    """Yield a connection to ``path``.
+
+    With ``readonly=True`` and an existing file whose stored schema version is
+    current, a ``query_only`` connection is yielded without running
+    :func:`initialize`, so readers never touch the write lock. Otherwise (file
+    missing, schema missing or outdated) the normal write path initializes it.
+    """
+    if readonly and str(path) != ":memory:" and Path(path).is_file():
+        conn = connect_readonly(path)
+        version = schema_version(conn)
+        if version is not None and version >= SCHEMA_VERSION:
+            try:
+                yield conn
+            finally:
+                conn.close()
+            return
+        conn.close()
     conn = connect(path)
     try:
         initialize(conn)
