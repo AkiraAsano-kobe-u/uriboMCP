@@ -239,13 +239,17 @@ READ_BUSY_TIMEOUT_S = 5
 def connect(path: str | Path) -> sqlite3.Connection:
     """Open a concurrency-friendly connection for desktop clients."""
     conn = sqlite3.connect(str(path), timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 30000")
-    if str(path) != ":memory:":
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA synchronous = NORMAL")
-    return conn
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 30000")
+        if str(path) != ":memory:":
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+        return conn
+    except BaseException:
+        conn.close()
+        raise
 
 
 def connect_readonly(path: str | Path) -> sqlite3.Connection:
@@ -256,20 +260,29 @@ def connect_readonly(path: str | Path) -> sqlite3.Connection:
     concerns and the former needs a lock when the mode would change.
     """
     conn = sqlite3.connect(str(path), timeout=READ_BUSY_TIMEOUT_S)
-    conn.row_factory = sqlite3.Row
+    try:
+        conn.row_factory = sqlite3.Row
+        _reader_pragmas(conn)
+        return conn
+    except BaseException:
+        conn.close()
+        raise
+
+
+def _reader_pragmas(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA query_only = 1")
-    conn.execute(f"PRAGMA busy_timeout = {READ_BUSY_TIMEOUT_S * 1000}")
-    return conn
+    conn.execute(f"PRAGMA busy_timeout = {int(READ_BUSY_TIMEOUT_S * 1000)}")
 
 
 def schema_version(conn: sqlite3.Connection) -> int | None:
     """Return the stored schema version, or ``None`` when the DB is uninitialized."""
-    try:
-        row = conn.execute(
-            "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()
-    except sqlite3.OperationalError:
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_meta'"
+    ).fetchone() is None:
         return None
+    row = conn.execute(
+        "SELECT value FROM schema_meta WHERE key='schema_version'"
+    ).fetchone()
     if row is None:
         return None
     try:
@@ -362,24 +375,27 @@ def initialize(conn: sqlite3.Connection) -> None:
 def database(path: str | Path, *, readonly: bool = False) -> Iterator[sqlite3.Connection]:
     """Yield a connection to ``path``.
 
-    With ``readonly=True`` and an existing file whose stored schema version is
-    current, a ``query_only`` connection is yielded without running
-    :func:`initialize`, so readers never touch the write lock. Otherwise (file
-    missing, schema missing or outdated) the normal write path initializes it.
+    With ``readonly=True``, caller connections always enforce query_only and a
+    five-second reader timeout. Current files skip initialization entirely.
+    Missing/old/invalid schemas require a migration writer first; it is never
+    yielded as a writer. For :memory: the initialized connection is switched to
+    reader mode to preserve its contents. Schema inspection failures propagate
+    without attempting migration.
     """
     if readonly and str(path) != ":memory:" and Path(path).is_file():
         conn = connect_readonly(path)
-        version = schema_version(conn)
-        if version is not None and version >= SCHEMA_VERSION:
-            try:
+        try:
+            version = schema_version(conn)
+            if version is not None and version >= SCHEMA_VERSION:
                 yield conn
-            finally:
-                conn.close()
-            return
-        conn.close()
+                return
+        finally:
+            conn.close()
     conn = connect(path)
     try:
         initialize(conn)
+        if readonly:
+            _reader_pragmas(conn)
         yield conn
     finally:
         conn.close()

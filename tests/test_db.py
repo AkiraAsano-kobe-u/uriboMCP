@@ -11,7 +11,217 @@ from pathlib import Path
 
 import pytest
 
+from uribo_mcp import db
 from uribo_mcp.db import SCHEMA_VERSION, connect, database, initialize
+
+
+@pytest.mark.parametrize("state", ["current", "old", "missing_meta", "missing_version", "invalid", "empty", "missing_file", "memory"])
+def test_all_readonly_paths_enforce_reader_contract(tmp_path, state):
+    path = tmp_path / "reader.db"
+    if state in {"current", "old", "missing_meta", "missing_version", "invalid"}:
+        with database(path) as conn:
+            if state == "missing_meta":
+                conn.execute("DROP TABLE schema_meta")
+            elif state == "missing_version":
+                conn.execute("DELETE FROM schema_meta")
+            elif state in {"old", "invalid"}:
+                conn.execute("UPDATE schema_meta SET value=?", ("0" if state == "old" else "invalid",))
+            conn.commit()
+    elif state == "empty":
+        sqlite3.connect(path).close()
+    elif state == "memory":
+        path = ":memory:"
+    with database(path, readonly=True) as conn:
+        assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("UPDATE items SET title='x'")
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("CREATE TABLE accidental_write(x)")
+
+
+def test_exclusive_lock_propagates_without_writer_fallback(tmp_path, monkeypatch):
+    path = tmp_path / "locked.db"
+    with database(path):
+        pass
+    blocker = sqlite3.connect(path)
+    blocker.execute("PRAGMA journal_mode=DELETE")
+    blocker.execute("BEGIN EXCLUSIVE")
+    calls = []
+    monkeypatch.setattr(db, "connect", lambda path: calls.append(path))
+    started = time.monotonic()
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            with database(path, readonly=True):
+                pytest.fail("must not yield under EXCLUSIVE lock")
+        assert time.monotonic() - started >= 4.8
+        assert calls == []
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+
+@pytest.mark.parametrize("readonly,pragma_index", [(False, 1), (False, 2), (False, 3), (False, 4), (True, 1), (True, 2)])
+def test_connect_pragma_failure_closes_connection(tmp_path, monkeypatch, readonly, pragma_index):
+    opened = []
+    original = sqlite3.connect
+
+    class Tracking(sqlite3.Connection):
+        closed = False
+        calls = 0
+
+        def execute(self, sql, *args):
+            self.calls += 1
+            if self.calls == pragma_index:
+                raise sqlite3.OperationalError("injected PRAGMA failure")
+            return super().execute(sql, *args)
+
+        def close(self):
+            self.closed = True
+            super().close()
+
+    def tracked(*args, **kwargs):
+        conn = original(*args, **kwargs, factory=Tracking)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(db.sqlite3, "connect", tracked)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="injected"):
+            (db.connect_readonly if readonly else db.connect)(tmp_path / "pragma.db")
+        assert opened and all(conn.closed for conn in opened)
+    finally:
+        for conn in opened:
+            conn.close()
+
+
+@pytest.mark.parametrize("readonly", [False, True])
+def test_schema_failure_closes_connection(tmp_path, monkeypatch, readonly):
+    path = tmp_path / "schema.db"
+    with database(path):
+        pass
+    opened = []
+    original = sqlite3.connect
+
+    class Tracking(sqlite3.Connection):
+        closed = False
+
+        def close(self):
+            self.closed = True
+            super().close()
+
+    def tracked(*args, **kwargs):
+        conn = original(*args, **kwargs, factory=Tracking)
+        opened.append(conn)
+        return conn
+
+    def fail(conn):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(db.sqlite3, "connect", tracked)
+    monkeypatch.setattr(db, "schema_version", fail)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="I/O"):
+            with database(path, readonly=readonly):
+                pytest.fail("must not yield")
+        assert opened and all(conn.closed for conn in opened)
+    finally:
+        for conn in opened:
+            conn.close()
+
+
+
+@pytest.mark.parametrize("message", ["database is locked", "database table is locked", "disk I/O error"])
+def test_schema_inspection_operational_errors_propagate(message):
+    class Broken(sqlite3.Connection):
+        def execute(self, *args):
+            raise sqlite3.OperationalError(message)
+
+    conn = sqlite3.connect(":memory:", factory=Broken)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match=message):
+            db.schema_version(conn)
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("state", ["missing_file", "old", "memory"])
+@pytest.mark.parametrize("failure", ["initialize", "query_only", "busy_timeout"])
+def test_migration_and_reader_setup_failures_close_all(tmp_path, monkeypatch, state, failure):
+    path = tmp_path / "fallback.db"
+    if state == "old":
+        with database(path) as conn:
+            conn.execute("UPDATE schema_meta SET value='0'")
+            conn.commit()
+    elif state == "memory":
+        path = ":memory:"
+    original = sqlite3.connect
+    opened = []
+    initialized = False
+
+    class Tracking(sqlite3.Connection):
+        closed = False
+
+        def execute(self, sql, *args):
+            if initialized and failure in sql:
+                raise sqlite3.OperationalError("injected reader setup")
+            return super().execute(sql, *args)
+
+        def close(self):
+            self.closed = True
+            super().close()
+
+    def tracked(*args, **kwargs):
+        conn = original(*args, **kwargs, factory=Tracking)
+        opened.append(conn)
+        return conn
+
+    def initializing(conn):
+        nonlocal initialized
+        if failure == "initialize":
+            raise sqlite3.OperationalError("injected migration")
+        initialize(conn)
+        initialized = True
+
+    monkeypatch.setattr(db.sqlite3, "connect", tracked)
+    monkeypatch.setattr(db, "initialize", initializing)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="injected"):
+            with database(path, readonly=True):
+                pytest.fail("must not yield")
+        assert opened and all(conn.closed for conn in opened)
+    finally:
+        for conn in opened:
+            conn.close()
+
+
+def test_corrupt_schema_inspection_closes_reader(tmp_path, monkeypatch):
+    path = tmp_path / "corrupt.db"
+    path.write_bytes(b"not a SQLite database" * 100)
+    opened = []
+    original = sqlite3.connect
+
+    class Tracking(sqlite3.Connection):
+        closed = False
+
+        def close(self):
+            self.closed = True
+            super().close()
+
+    def tracked(*args, **kwargs):
+        conn = original(*args, **kwargs, factory=Tracking)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(db.sqlite3, "connect", tracked)
+    try:
+        with pytest.raises(sqlite3.DatabaseError, match="not a database"):
+            with database(path, readonly=True):
+                pytest.fail("must not yield")
+        assert len(opened) == 1 and opened[0].closed
+    finally:
+        for conn in opened:
+            conn.close()
 
 
 def _seed_items(conn: sqlite3.Connection, count: int = 20) -> None:

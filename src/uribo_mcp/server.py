@@ -340,11 +340,11 @@ def build_server(settings: Settings | None = None):
 
     @server.tool(annotations=read_only)
     def list_courses(
-        available_only: bool = True, fields: Literal["summary", "full"] = "summary"
+        available_only: bool = True, fields: Literal["summary", "full"] = "full"
     ) -> dict[str, Any]:
         """同期済みの授業一覧を返す。
 
-        fields="summary"（既定）は id/source/idnumber/course_code/course_name/
+        fields="full" が既定。軽量化する fields="summary"は id/source/idnumber/course_code/course_name/
         academic_year/term/schedule_text/available のみ。instructors・summary・
         metadata 等が必要なら fields="full"。
         """
@@ -360,11 +360,11 @@ def build_server(settings: Settings | None = None):
         kinds: list[str] | None = None,
         available_only: bool = True,
         limit: int = 100,
-        fields: Literal["summary", "full"] = "summary",
+        fields: Literal["summary", "full"] = "full",
     ) -> dict[str, Any]:
         """授業内の教材・お知らせ・課題・テスト等のメタデータ一覧を返す。
 
-        fields="summary"（既定）は id/source/category/title/url/course_name/
+        fields="full" が既定。軽量化する fields="summary"は id/source/category/title/url/course_name/
         course_id/published_at/deadline/is_done/available/updated_at/
         attachment_count のみ。metadata・content_hash・各種タイムスタンプが必要なら
         fields="full" か get_course_content(item_id)。
@@ -396,18 +396,18 @@ def build_server(settings: Settings | None = None):
         course: str | None = None,
         kinds: list[str] | None = None,
         limit: int = 20,
-        include_text: bool = False,
+        include_text: bool = True,
     ) -> dict[str, Any]:
         """授業本文と抽出済みPDF／Office文書を横断検索する。
 
         複数語のクエリは全語を含む結果を優先する（match_mode="all"）。全語一致が
         0件のときは語ごとの一致に自動で切り替え（match_mode="any"）、一致語数→
-        スコア順で返す。各結果の tokens_matched と tokens_unmatched（どの資料にも
-        無い語）を見て、語を削って再検索する前に判断すること。
+        スコア順で返す（旧来の厳密ANDのみの検索とは異なる）。tokens_unmatched は
+        limit適用前の検索スコープ内で無一致の語であり、資料不存在の証明ではない。
 
-        文書結果は既定で snippet（一致語を中心に約300文字）と text_chars のみを
-        返す。全文が必要なら include_text=true か、attachment_id と
-        page_start/page_end を read_document に渡す。
+        文書結果は既定で全文 text、snippet（一致語を中心に約300文字）、text_chars
+        を返す。軽量化は include_text=false を明示する。全文は attachment_id と
+        page_start/page_end を read_document に渡しても取得できる。
         """
         with database(settings.paths.db_path, readonly=True) as conn:
             repository = Repository(conn)

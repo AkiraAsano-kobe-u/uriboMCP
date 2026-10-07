@@ -16,6 +16,7 @@ from uribo_mcp.repository import (
     COURSE_SUMMARY_FIELDS,
     ITEM_SUMMARY_FIELDS,
     Repository,
+    _first_match_offset,
     make_snippet,
     normalize_search,
 )
@@ -667,6 +668,18 @@ def test_build_study_context_uses_full_text_not_snippet(tmp_path: Path) -> None:
 # --------------------------------------------------------------- fields="summary"
 
 
+@pytest.mark.parametrize("suffix", ["", "z"])
+def test_snippet_canonical_reordering_maps_original_origin(suffix):
+    text = "前" * 400 + "a\u0301" + "\u0323" * 200 + suffix + "後" * 400
+    token = "\u0301" + suffix
+    assert token in normalize_search(text)
+    assert _first_match_offset(text, [token]) == 401
+    snippet = make_snippet(text, [token], snippet_chars=300)
+    assert "\u0301" in snippet
+    assert snippet.strip("…") in text
+
+
+
 def test_list_course_content_summary_fields(fixture_db: tuple[Path, dict[str, Any]]) -> None:
     path, ids = fixture_db
     dropped = {
@@ -690,7 +703,7 @@ def test_list_course_content_summary_fields(fixture_db: tuple[Path, dict[str, An
         with pytest.raises(ValueError):
             repo.list_course_content(ids["c1"], fields="bogus")
     assert summary and len(summary) == len(full)
-    assert default == summary  # Both repository and tool default to summary.
+    assert default == full  # Existing callers retain the complete payload.
     for item in summary:
         assert set(item) == set(ITEM_SUMMARY_FIELDS)
         assert not (set(item) & dropped)
@@ -708,7 +721,7 @@ def test_list_courses_summary_fields(fixture_db: tuple[Path, dict[str, Any]]) ->
         repo = Repository(conn)
         summary = repo.list_courses(fields="summary")
         full = repo.list_courses(fields="full")
-        assert repo.list_courses() == summary
+        assert repo.list_courses() == full
     assert len(summary) == len(full) == 2
     for course in summary:
         assert set(course) == set(COURSE_SUMMARY_FIELDS)
@@ -716,3 +729,60 @@ def test_list_courses_summary_fields(fixture_db: tuple[Path, dict[str, Any]]) ->
     for course in full:
         assert {"instructors", "metadata", "summary", "source_url", "content_hash"} <= set(course)
     assert [c["id"] for c in summary] == [c["id"] for c in full]
+
+
+@pytest.mark.parametrize("mode", ["all", "any"])
+def test_search_1001_unique_tokens_preserves_all_tokens(fixture_db, mode):
+    path, ids = fixture_db
+    tokens = [f"q{index:04d}" for index in range(1001)]
+    text = " ".join(tokens) if mode == "all" else tokens[-1]
+    with database(path) as conn:
+        conn.execute("UPDATE document_chunks SET text=?, search_text=? WHERE attachment_id=?",
+                     (text, text, ids["taylor.pdf"]))
+        # A match outside the requested course must not influence tokens_unmatched.
+        conn.execute("UPDATE document_chunks SET text=?, search_text=? WHERE attachment_id=?",
+                     (tokens[0], tokens[0], ids["other_course.pdf"]))
+        conn.commit()
+    with database(path, readonly=True) as conn:
+        result = Repository(conn).search_course_content_detail(
+            " ".join(tokens), course_id=ids["c1"], kinds=["material"]
+        )
+    assert result["tokens"] == tokens
+    assert result["match_mode"] == mode
+    assert result["tokens_unmatched"] == ([] if mode == "all" else tokens[:-1])
+    assert result["results"]
+    expected = tokens if mode == "all" else [tokens[-1]]
+    assert all(hit["tokens_matched"] == expected for hit in result["results"])
+
+
+def test_document_candidate_transfer_guard(fixture_db):
+    """Guard SQL selectivity by transferred rows, never by elapsed time."""
+    path, ids = fixture_db
+    with database(path) as conn:
+        attachment = ids["taylor.pdf"]
+        for index in range(200):
+            conn.execute(
+                "INSERT INTO document_chunks(attachment_id, chunk_index, page_start, page_end, text, search_text) "
+                "VALUES (?, ?, 1, 1, 'unrelated text', 'unrelated text')",
+                (attachment, 100 + index),
+            )
+        conn.commit()
+    transferred = []
+    with database(path, readonly=True) as conn:
+        def track(cursor, values):
+            row = sqlite3.Row(cursor, values)
+            if "search_text" in row.keys():
+                transferred.append(row["id"])
+            return row
+
+        expected = conn.execute(
+            "SELECT count(*) FROM document_chunks dc "
+            "JOIN attachments a ON a.id=dc.attachment_id "
+            "JOIN items i ON i.id=a.item_id "
+            "WHERE a.available=1 AND instr(dc.search_text, ?)>0", ("誤差",)
+        ).fetchone()[0]
+        conn.row_factory = track
+        results = Repository(conn).search_course_content("誤差", include_text=False)
+    assert results and expected > 0
+    assert len(transferred) == expected
+    assert len(transferred) < 20

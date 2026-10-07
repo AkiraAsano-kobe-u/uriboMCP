@@ -218,12 +218,12 @@ def test_real_stdio_handshake_lists_tools(tmp_path: Path) -> None:
                 tools = await session.list_tools()
                 assert {tool.name for tool in tools.tools} == EXPECTED_TOOLS
                 schemas = {tool.name: tool.inputSchema["properties"] for tool in tools.tools}
-                assert schemas["search_course_content"]["include_text"]["default"] is False
-                assert schemas["list_course_content"]["fields"]["default"] == "summary"
-                assert schemas["list_courses"]["fields"]["default"] == "summary"
+                assert schemas["search_course_content"]["include_text"]["default"] is True
+                assert schemas["list_course_content"]["fields"]["default"] == "full"
+                assert schemas["list_courses"]["fields"]["default"] == "full"
 
                 slim = await session.call_tool(
-                    "search_course_content", {"query": "誤差 打ち切り", "limit": 5}
+                    "search_course_content", {"query": "誤差 打ち切り", "limit": 5, "include_text": False}
                 )
                 assert slim.structuredContent is not None
                 payload = slim.structuredContent
@@ -239,7 +239,7 @@ def test_real_stdio_handshake_lists_tools(tmp_path: Path) -> None:
 
                 full = await session.call_tool(
                     "search_course_content",
-                    {"query": "誤差", "limit": 5, "include_text": True},
+                    {"query": "誤差", "limit": 5},
                 )
                 assert len(full.structuredContent["results"][0]["text"]) == 811
 
@@ -250,18 +250,18 @@ def test_real_stdio_handshake_lists_tools(tmp_path: Path) -> None:
                 assert any_mode.structuredContent["tokens_unmatched"] == ["隤週"]
 
                 summary = await session.call_tool(
-                    "list_course_content", {"course": "数値解析", "limit": 10}
+                    "list_course_content", {"course": "数値解析", "limit": 10, "fields": "summary"}
                 )
                 item = summary.structuredContent["items"][0]
                 assert "metadata" not in item and "content_hash" not in item
                 assert item["attachment_count"] == 1
                 full_items = await session.call_tool(
                     "list_course_content",
-                    {"course": "数値解析", "limit": 10, "fields": "full"},
+                    {"course": "数値解析", "limit": 10},
                 )
                 assert "metadata" in full_items.structuredContent["items"][0]
 
-                courses = await session.call_tool("list_courses", {})
+                courses = await session.call_tool("list_courses", {"fields": "summary"})
                 course = courses.structuredContent["courses"][0]
                 assert set(course) == {
                     "id",
@@ -274,7 +274,7 @@ def test_real_stdio_handshake_lists_tools(tmp_path: Path) -> None:
                     "schedule_text",
                     "available",
                 }
-                full_courses = await session.call_tool("list_courses", {"fields": "full"})
+                full_courses = await session.call_tool("list_courses", {})
                 assert "instructors" in full_courses.structuredContent["courses"][0]
 
                 context = await session.call_tool(
@@ -285,3 +285,21 @@ def test_real_stdio_handshake_lists_tools(tmp_path: Path) -> None:
                 assert context.structuredContent["match_mode"] == "all"
 
     asyncio.run(run())
+
+
+def test_mcp_search_1001_unique_tokens(tmp_path):
+    settings = load_settings(root=tmp_path)
+    _seed_long_document(settings)
+    tokens = [f"q{index:04d}" for index in range(1000)] + ["誤差"]
+    server = build_server(settings)
+
+    async def call():
+        response = await server.call_tool("search_course_content", {"query": " ".join(tokens)})
+        return response[1]
+
+    result = asyncio.run(call())
+    assert result["tokens"] == tokens
+    assert result["match_mode"] == "any"
+    assert result["tokens_unmatched"] == tokens[:-1]
+    assert result["results"]
+    assert all(hit["tokens_matched"] == ["誤差"] for hit in result["results"])

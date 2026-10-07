@@ -8,6 +8,7 @@ import re
 import shutil
 import sqlite3
 import unicodedata
+from collections import defaultdict, deque
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -92,26 +93,54 @@ def _check_fields(fields: str) -> str:
 
 
 def _first_match_offset(text: str, tokens: Sequence[str]) -> int:
-    """Locate the earliest normalized token in the original text.
+    """Locate a whole-string NFKC match using decomposition origin spans.
 
-    Normalize the whole string, not individual characters: NFKC composes kana
-    voicing marks, combining accents and Hangul Jamo across character boundaries.
-    Normalized prefix lengths then map the match back to an original offset.
+    NFD(NFKC(text)) and NFKD(text) contain the same decomposed characters.
+    Canonical reordering never swaps identical characters, so their FIFO origin
+    queues map composition/reordering without implementing a Unicode normalizer.
+    A composed character owns the enclosing span of all its original contributors.
+    Casefold expansion and collapsed whitespace retain those spans.
     """
     haystack = normalize_search(text)
-    positions = [haystack.find(token) for token in tokens]
-    found = [position for position in positions if position >= 0]
+    found = [position for token in tokens if (position := haystack.find(token)) >= 0]
     if not found:
         return 0
     first = min(found)
-    low, high = 1, len(text)
-    while low < high:
-        middle = (low + high) // 2
-        if len(normalize_search(text[:middle])) > first:
-            high = middle
+    # A normalized string's prefixes are normalized too: no composition or
+    # reordering can move contributors across the prefix boundary. Keep the
+    # inexpensive monotone prefix lookup only in this provably safe case.
+    if unicodedata.is_normalized("NFKC", text):
+        low, high = 1, len(text)
+        while low < high:
+            middle = (low + high) // 2
+            if len(normalize_search(text[:middle])) > first:
+                high = middle
+            else:
+                low = middle + 1
+        return low - 1
+    origins: dict[str, deque[int]] = defaultdict(deque)
+    for index, char in enumerate(text):
+        for decomposed in unicodedata.normalize("NFKD", char):
+            origins[decomposed].append(index)
+    folded: list[tuple[str, tuple[int, int]]] = []
+    for char in unicodedata.normalize("NFKC", text):
+        contributors = [origins[d].popleft() for d in unicodedata.normalize("NFD", char)]
+        span = (min(contributors), max(contributors) + 1)
+        folded.extend((part, span) for part in char.casefold())
+    mapped: list[tuple[str, tuple[int, int]]] = []
+    for char, span in folded:
+        if char.isspace():
+            if mapped and mapped[-1][0] == " ":
+                previous = mapped[-1][1]
+                mapped[-1] = (" ", (min(previous[0], span[0]), max(previous[1], span[1])))
+            elif mapped:
+                mapped.append((" ", span))
         else:
-            low = middle + 1
-    return low - 1
+            mapped.append((char, span))
+    if mapped and mapped[-1][0] == " ":
+        mapped.pop()
+    assert "".join(char for char, _ in mapped) == haystack
+    return mapped[first][1][0]
 
 
 def make_snippet(text: str, tokens: Sequence[str], *, snippet_chars: int) -> str:
@@ -562,7 +591,7 @@ class Repository:
     # ------------------------------------------------------------------- reads
 
     def list_courses(
-        self, *, available_only: bool = True, fields: str = "summary"
+        self, *, available_only: bool = True, fields: str = "full"
     ) -> list[dict[str, Any]]:
         fields = _check_fields(fields)
         sql = "SELECT * FROM courses"
@@ -610,7 +639,7 @@ class Repository:
         kinds: Sequence[str] | None = None,
         available_only: bool = True,
         limit: int = 100,
-        fields: str = "summary",
+        fields: str = "full",
     ) -> list[dict[str, Any]]:
         fields = _check_fields(fields)
         where = ["i.course_id=?"]
@@ -682,7 +711,9 @@ class Repository:
         the historical behaviour). Only when no row contains all tokens and the
         query has two or more tokens, rows matching *any* token are returned
         (``match_mode="any"``), ranked by number of matched tokens, then score,
-        then recency. ``tokens_unmatched`` lists tokens that hit nothing at all.
+        then recency. This deliberately differs from historical strict AND.
+        ``tokens_unmatched`` covers the searched scope before limiting results,
+        not proof that material does not exist elsewhere.
 
         Document results always carry ``snippet`` (a ``snippet_chars`` window
         around the first matched token, "…" marks a cut) and ``text_chars``;
@@ -732,11 +763,20 @@ class Repository:
         # time, so SQL instr() substring matching is exactly the Python `in` test.
         # Candidates are pre-filtered with OR in SQL; the AND/ANY decision and the
         # score stay in Python on the (small) candidate set.
-        doc_where = [
-            "a.available=1",
-            "(" + " OR ".join("instr(dc.search_text, ?)>0" for _ in unique_tokens) + ")",
-        ]
-        doc_params: list[Any] = [*unique_tokens]
+        doc_where = ["a.available=1"]
+        doc_params: list[Any] = []
+        # Bound SQL expression depth and parameters; retain every token in the
+        # Python scan for oversized queries, with the same ranking and scope.
+        sql_token_limit = min(
+            200,
+            max(0, self.conn.getlimit(sqlite3.SQLITE_LIMIT_EXPR_DEPTH) - 10),
+            max(0, self.conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) - len(params)),
+        )
+        if len(unique_tokens) <= sql_token_limit:
+            doc_where.append(
+                "(" + " OR ".join("instr(dc.search_text, ?)>0" for _ in unique_tokens) + ")"
+            )
+            doc_params.extend(unique_tokens)
         if course_id is not None:
             doc_where.append("a.course_id=?")
             doc_params.append(course_id)
