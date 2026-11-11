@@ -18,7 +18,7 @@ uv run uribo-mcp setup
 
 Keep secrets in the OS credential store rather than in a desktop-client configuration.
 
-Generate client-specific materials with argument arrays and absolute paths. This is safe for Japanese and space-containing paths, such as an OneDrive project directory, and does not change Claude/Codex settings.
+Generate client-specific materials with argument arrays and absolute paths. This is safe for Japanese and space-containing paths, and does not change Claude/Codex settings.
 
 ```powershell
 .\scripts\New-ClientConfigs.ps1 `

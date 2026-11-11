@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sys
+import threading
 import tomllib
 import urllib.error
 import urllib.request
@@ -13,7 +15,13 @@ from uribo_mcp.auth import PASSWORD_KEY, USERNAME_KEY
 from uribo_mcp.cli import main
 from uribo_mcp.config import load_settings
 from uribo_mcp.errors import ConfigurationError
-from uribo_mcp.first_run_ui import TOKEN_HEADER, SetupSession, setup_url, start_server
+from uribo_mcp.first_run_ui import (
+    TOKEN_HEADER,
+    SetupSession,
+    run_setup_ui,
+    setup_url,
+    start_server,
+)
 
 
 class MemoryStore:
@@ -363,3 +371,232 @@ def test_ui_save_reports_bad_input_without_finishing(ui) -> None:
 
     assert status == 400 and "absolute" in json.loads(text)["error"]
     assert not session.done.is_set()
+
+
+def test_ui_refuses_a_second_save_and_non_json_bodies(ui, tmp_path: Path) -> None:
+    session, server, store = ui
+    body = {
+        "storage_dir": str(tmp_path / "first"),
+        "sources": ["csi"],
+        "username": "1234567x",
+        "password": "hunter2-secret",
+    }
+    url = f"http://127.0.0.1:{server.server_address[1]}/api/save"
+    for data, content_type, expected in (
+        (b"storage_dir=x", "application/x-www-form-urlencoded", 415),
+        (b"not json", "application/json", 400),
+        (b"[]", "application/json", 400),
+    ):
+        request = urllib.request.Request(url, data=data, method="POST")
+        request.add_header("Content-Type", content_type)
+        request.add_header(TOKEN_HEADER, session.token)
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, timeout=5)
+        assert caught.value.code == expected
+    assert not session.done.is_set()
+
+    assert _request(server, "/api/save", token=session.token, body=body)[0] == 200
+    status, text, _ = _request(
+        server,
+        "/api/save",
+        token=session.token,
+        body={**body, "storage_dir": str(tmp_path / "second"), "password": "other"},
+    )
+
+    assert status == 400 and "保存済み" in json.loads(text)["error"]
+    assert store.get(PASSWORD_KEY) == "hunter2-secret"
+    assert not (tmp_path / "second").exists()
+    assert session.result["paths"]["data_dir"] == str(tmp_path / "first" / "data")
+
+
+def test_ui_leaves_the_keyring_alone_when_folders_cannot_be_created(ui, tmp_path: Path) -> None:
+    session, server, store = ui
+    blocker = tmp_path / "a-file"
+    blocker.write_text("x", encoding="utf-8")
+
+    status, _text, _ = _request(
+        server,
+        "/api/save",
+        token=session.token,
+        body={
+            "storage_dir": str(blocker / "inside"),
+            "sources": ["csi"],
+            "username": "1234567x",
+            "password": "hunter2-secret",
+        },
+    )
+
+    assert status == 400
+    assert store.values == {}
+    assert not session.done.is_set()
+
+
+def test_ui_rerun_keeps_customised_folders_for_the_same_storage(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    store = MemoryStore()
+    store.set(USERNAME_KEY, "1234567x")
+    store.set(PASSWORD_KEY, "already-there")
+    initial = first_run.build_plan(tmp_path / "store", cache_dir=tmp_path / "big" / "cache")
+    session = SetupSession(
+        root=root, config_path=root / "config.local.toml", initial=initial, secret_store=store
+    )
+
+    same = session.save({"storage_dir": str(tmp_path / "store"), "sources": ["csi"]})
+    assert same["paths"]["cache_dir"] == str(tmp_path / "big" / "cache")
+
+    session.done.clear()
+    moved = session.save({"storage_dir": str(tmp_path / "elsewhere"), "sources": ["csi"]})
+    assert moved["paths"]["cache_dir"] == str(tmp_path / "elsewhere" / "data" / "cache")
+    assert moved["backup_path"] is not None
+
+
+def test_run_setup_ui_returns_the_saved_result_and_closes_the_port(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    store = MemoryStore()
+    seen: dict[str, str] = {}
+
+    def fill_in_form(url: str) -> None:
+        seen["url"] = url
+        port, token = url.split(":")[2].split("/")[0], url.split("t=")[1]
+
+        def post() -> None:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/save",
+                data=json.dumps(
+                    {
+                        "storage_dir": str(tmp_path / "store"),
+                        "sources": ["csi"],
+                        "username": "1234567x",
+                        "password": "hunter2-secret",
+                    }
+                ).encode("utf-8"),
+                method="POST",
+            )
+            request.add_header("Content-Type", "application/json")
+            request.add_header(TOKEN_HEADER, token)
+            urllib.request.urlopen(request, timeout=5).read()
+
+        threading.Thread(target=post, daemon=True).start()
+
+    result = run_setup_ui(
+        root=root,
+        config_path=root / "config.local.toml",
+        initial=first_run.build_plan(tmp_path / "default"),
+        open_browser=False,
+        timeout=10,
+        secret_store=store,
+        announce=fill_in_form,
+    )
+
+    assert result["ok"] is True and result["kobe_credentials_stored"] is True
+    assert store.get(PASSWORD_KEY) == "hunter2-secret"
+    assert "hunter2-secret" not in json.dumps(result)
+    with pytest.raises(urllib.error.URLError):
+        urllib.request.urlopen(seen["url"], timeout=2)
+
+
+def test_run_setup_ui_times_out_without_writing_anything(tmp_path: Path) -> None:
+    result = run_setup_ui(
+        root=tmp_path,
+        config_path=tmp_path / "config.local.toml",
+        initial=first_run.build_plan(tmp_path / "default"),
+        open_browser=False,
+        timeout=0.2,
+        secret_store=MemoryStore(),
+        announce=lambda _url: None,
+    )
+
+    assert result == {
+        "ok": False,
+        "reason": "timeout",
+        "detail": "The setup form was not saved within 0 seconds.",
+    }
+    assert not (tmp_path / "config.local.toml").exists()
+    assert not (tmp_path / "default").exists()
+
+
+# ------------------------------------------------------- existing/broken files
+def test_broken_config_is_backed_up_and_replaced_with_force(tmp_path: Path, capsys) -> None:
+    config = tmp_path / "config.local.toml"
+    config.write_text("[paths\ndata_dir = oops", encoding="utf-8")
+    store = tmp_path / "store"
+
+    assert first_run.plan_from_existing(config, tmp_path) is None
+    assert main(["--root", str(tmp_path), "setup", "--no-ui", "--storage-dir", str(store)]) == 2
+    capsys.readouterr()
+    code = main(["--root", str(tmp_path), "setup", "--no-ui", "--force", "--storage-dir", str(store)])
+    result = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert Path(result["backup_path"]).read_text(encoding="utf-8") == "[paths\ndata_dir = oops"
+    assert load_settings(root=tmp_path).paths.data_dir == (store / "data").resolve()
+
+
+def test_repeated_setup_never_overwrites_the_first_backup(tmp_path: Path) -> None:
+    config = tmp_path / "config.local.toml"
+    config.write_text('[paths]\ndata_dir = "hand-written"\n', encoding="utf-8")
+
+    first = first_run.apply_setup(
+        first_run.build_plan(tmp_path / "one"), config_path=config, root=tmp_path, force=True
+    )
+    second = first_run.apply_setup(
+        first_run.build_plan(tmp_path / "two"), config_path=config, root=tmp_path, force=True
+    )
+
+    assert "hand-written" in Path(first["backup_path"]).read_text(encoding="utf-8")
+    assert second["backup_path"] != first["backup_path"]
+    assert str(tmp_path / "one").replace("\\", "\\\\") in Path(second["backup_path"]).read_text(
+        encoding="utf-8"
+    )
+
+
+def test_existing_config_with_unusual_keys_still_renders(tmp_path: Path) -> None:
+    plan = first_run.build_plan(tmp_path / "store")
+
+    text = first_run.render_config(plan, {"custom section": {"key with space": "v"}})
+
+    assert tomllib.loads(text)["custom section"] == {"key with space": "v"}
+    with pytest.raises(ConfigurationError):
+        first_run.render_config(plan, {"documents": {"nested": {"a": 1}}})
+
+
+def test_percent_variables_expand_but_dollar_names_are_kept(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("URIBO_TEST_BASE", str(tmp_path))
+
+    plan = first_run.build_plan("%URIBO_TEST_BASE%/$data/%NOT_SET%")
+
+    assert plan.storage_dir == tmp_path / "$data" / "%NOT_SET%"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Credential Manager round trip")
+def test_login_round_trips_through_the_real_windows_keyring(tmp_path: Path) -> None:
+    import secrets as random_names
+
+    from uribo_mcp.auth import KeyringSecretStore
+
+    store = KeyringSecretStore(service=f"uribo-mcp-test-{random_names.token_hex(4)}")
+    root = tmp_path / "project"
+    root.mkdir()
+    session = SetupSession(
+        root=root,
+        config_path=root / "config.local.toml",
+        initial=first_run.build_plan(tmp_path / "store"),
+        secret_store=store,
+    )
+    try:
+        result = session.save(
+            {
+                "storage_dir": str(tmp_path / "保存 先"),
+                "sources": ["csi"],
+                "username": "1234567x",
+                "password": "pässwörd 日本語 !\"#$%",
+            }
+        )
+        assert result["kobe_credentials_stored"] is True
+        assert store.get(USERNAME_KEY) == "1234567x"
+        assert store.get(PASSWORD_KEY) == "pässwörd 日本語 !\"#$%"
+    finally:
+        store.delete(USERNAME_KEY)
+        store.delete(PASSWORD_KEY)

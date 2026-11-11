@@ -10,7 +10,9 @@
   ファイルに書かない。入力は手順 3 のブラウザフォームでユーザー本人が行う。
 - 既存の MCP クライアント設定は上書きしない。`uribo-mcp` の項目を追加するだけにする。
 - コマンドが失敗したら推測で先へ進まず、出力をそのままユーザーに見せる。
-- 対象は Windows 10 / 11。それ以外の OS なら、対象外であることを伝えて止まる。
+- 対象は Windows 11（Windows 10 は未検証）。それ以外の OS なら、対象外であることを伝えて止まる。
+- `uv` や `uribo-mcp` は進捗を標準エラーに出す。標準エラーへの出力だけで失敗と判断せず、
+  終了コードで判断する。
 
 ## 0. 先にユーザーへ確認する
 
@@ -22,7 +24,8 @@
 4. 定期同期を Windows タスクスケジューラに登録するか（する）
 
 どちらのフォルダも OneDrive などクラウド同期の配下は避ける（データベースが壊れることがある）。
-以下、決まった値を `<INSTALL_DIR>` と `<DATA_DIR>` と書く。
+以下、決まった値を `<INSTALL_DIR>` と `<DATA_DIR>` と書く。コマンドには `%USERPROFILE%` のままではなく、
+`$env:USERPROFILE` を展開した絶対パスを入れる。
 
 ## 1. 前提ソフトを確認する
 
@@ -31,14 +34,20 @@ git --version
 uv --version
 ```
 
-無いものだけ入れる。入れた後は新しいシェルで PATH を読み直す。
+無いものだけ入れる。管理者権限の確認（UAC）が出たら、ユーザーに許可を頼む。
 
 ```powershell
-winget install --id Git.Git -e
-winget install --id astral-sh.uv -e
+winget install --id Git.Git -e --accept-package-agreements --accept-source-agreements
+winget install --id astral-sh.uv -e --accept-package-agreements --accept-source-agreements
 ```
 
-Google Chrome も必要（大学のログインに使う）。無ければ
+入れた後は、同じセッションで PATH を読み直す。
+
+```powershell
+$env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
+```
+
+Google Chrome も必要（大学のログインに使う）。無ければ同じオプションで
 `winget install --id Google.Chrome -e`。Python は `uv` が自動で用意するので不要。
 
 ## 2. 取得して依存を入れる
@@ -53,17 +62,19 @@ uv sync
 
 ## 3. 保存先と大学アカウントを設定する
 
+コマンドを実行する前に、ユーザーへ「これからブラウザに設定フォームが開きます。保存先と
+同期する情報を確認し、大学のログイン ID とパスワードを入力して『設定を保存』を押してください」
+と伝える。それから実行する。
+
 ```powershell
 uv run uribo-mcp setup --storage-dir "<DATA_DIR>"
 ```
 
-- ブラウザに設定フォームが開く。ユーザーに「開いたフォームで保存先と同期する情報を確認し、
-  大学のログイン ID とパスワードを入力して『設定を保存』を押してください」と伝える。
 - コマンドはフォームが保存されるまで待つ（最長 15 分）。エージェント側のコマンド
   タイムアウトが短い場合は、タイムアウトを 10 分に延ばすかバックグラウンドで実行する。
   待ち時間は `--timeout 秒` で変えられる。
 - ブラウザが開かなければ、標準エラーに出る `Setup form: http://127.0.0.1:...` の URL を
-  ユーザーに渡して開いてもらう。
+  ユーザーに渡して開いてもらう。最初から URL だけを出すには `--no-browser` を付ける。
 - 終了すると標準出力に JSON が出る。`"ok": true` と `"kobe_credentials_stored": true` を確認する。
   `"reason": "timeout"` なら同じコマンドをやり直す。
 - JSON の `config_path` と `mcp_server` は手順 6 で使う。
@@ -105,14 +116,18 @@ uv run uribo-mcp refresh --scope csi --wait
 uv run uribo-mcp refresh
 ```
 
-すぐにジョブ ID が返り、同期は裏で続く。初回は授業資料をすべて取得するため
+すぐにジョブ ID が返り、同期は裏で続く。30 秒ほど待って
+`<DATA_DIR>\data\logs\<ジョブID>.log` に追記が続いていることを確かめる。止まっていたら、
+ユーザー自身のターミナルで `uv run uribo-mcp refresh --wait` を実行してもらう。初回は授業資料をすべて取得するため
 数十分かかることがある。完了を待たずに次へ進んでよい。進み具合は
 `<DATA_DIR>\data\logs\<ジョブID>.log`、または登録後の MCP ツール
 `get_refresh_status` と `get_source_health` で確認できる。
 
 ## 6. MCP クライアントに登録する
 
-手順 3 の JSON にある `config_path` を `<CONFIG>` として使う。
+手順 3 の JSON にある `config_path` を `<CONFIG>` として使う。先に `claude mcp get uribo-mcp` や
+`codex mcp list` で確かめ、`uribo-mcp` が登録済みなら変更せずにユーザーへ報告し、
+置き換えるかどうかを尋ねる。
 
 Claude Code:
 
@@ -131,6 +146,9 @@ codex mcp list
 Claude Desktop: `%APPDATA%\Claude\claude_desktop_config.json` の `mcpServers` に、
 手順 3 の JSON の `mcp_server` の値を `"uribo-mcp"` というキーで追加する。
 ファイルが無ければ `{"mcpServers": {"uribo-mcp": ...}}` で新しく作る。既存の項目は残す。
+ファイルの場所は Claude Desktop の Settings > Developer > Edit Config でも確かめられる。
+PowerShell で編集する場合は `ConvertTo-Json -Depth 10` を使い、BOM なしの UTF-8 で書く
+（`[IO.File]::WriteAllText($path, $json, (New-Object Text.UTF8Encoding $false))`）。
 保存後、Claude Desktop の再起動をユーザーに頼む。
 
 ## 7. 定期同期を登録する（ユーザーが希望した場合）

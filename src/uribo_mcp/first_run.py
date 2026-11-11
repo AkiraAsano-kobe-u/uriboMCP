@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tomllib
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -69,7 +71,9 @@ def _absolute(raw: str | Path, *, name: str) -> Path:
         raise ConfigurationError(f"{name} must not be empty")
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
         raise ConfigurationError(f"{name} contains a control character")
-    path = Path(os.path.expandvars(text)).expanduser()
+    # Only %NAME% is expanded: "$" is a legal character in Windows folder names.
+    text = re.sub(r"%([A-Za-z_][A-Za-z0-9_()]*)%", lambda m: os.environ.get(m[1], m[0]), text)
+    path = Path(text).expanduser()
     if not path.is_absolute():
         raise ConfigurationError(f"{name} must be an absolute path: {text}")
     return Path(os.path.normpath(path))
@@ -143,6 +147,10 @@ def _toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _toml_key(key: str) -> str:
+    return key if re.fullmatch(r"[A-Za-z0-9_-]+", key) else _toml_string(key)
+
+
 def _toml_value(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
@@ -172,11 +180,16 @@ def render_config(plan: SetupPlan, existing: dict[str, Any] | None = None) -> st
     order = ["paths", "sync"] + [name for name in data if name not in {"paths", "sync"}]
     lines = ["# Written by `uribo-mcp setup`. Re-run it to change these values.", ""]
     for section in order:
-        lines.append(f"[{section}]")
-        lines.extend(f"{key} = {_toml_value(value)}" for key, value in data[section].items())
+        lines.append(f"[{_toml_key(section)}]")
+        lines.extend(
+            f"{_toml_key(key)} = {_toml_value(value)}" for key, value in data[section].items()
+        )
         lines.append("")
     text = "\n".join(lines)
-    tomllib.loads(text)  # never write a file the loader cannot read back
+    try:
+        tomllib.loads(text)  # never write a file the loader cannot read back
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigurationError(f"Cannot render the config: {exc}") from exc
     return text
 
 
@@ -191,7 +204,10 @@ def read_existing(config_path: Path) -> dict[str, Any] | None:
 
 def plan_from_existing(config_path: Path, root: Path) -> SetupPlan | None:
     """The plan an existing config describes, used to prefill a re-run."""
-    existing = read_existing(config_path)
+    try:
+        existing = read_existing(config_path)
+    except ConfigurationError:
+        return None  # unreadable: the setup offers defaults and replaces it
     if existing is None:
         return None
     paths = existing.get("paths", {}) if isinstance(existing.get("paths", {}), dict) else {}
@@ -258,19 +274,25 @@ def apply_setup(
     credentials_present: bool | None = None,
 ) -> dict[str, Any]:
     """Create the folders and write the config. Never touches credentials."""
-    existing = read_existing(config_path)
-    if existing is not None and not force:
+    if config_path.is_file() and not force:
         raise ConfigurationError(
             f"{config_path} already exists. Re-run with --force to replace it "
             "(the previous file is kept as .bak)."
         )
+    try:
+        existing = read_existing(config_path)
+    except ConfigurationError:
+        existing = None  # a broken file is backed up below and replaced
     text = render_config(plan, existing)
     for directory in (*plan.directories(), plan.data_dir / "logs"):
         directory.mkdir(parents=True, exist_ok=True)
     config_path.parent.mkdir(parents=True, exist_ok=True)
     backup = None
-    if existing is not None:
+    if config_path.is_file():
         backup = config_path.with_name(config_path.name + ".bak")
+        if backup.exists():  # keep the oldest backup: it may be a hand-written config
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            backup = config_path.with_name(f"{config_path.name}.{stamp}.bak")
         shutil.copy2(config_path, backup)
     temp = config_path.with_name(config_path.name + ".tmp")
     temp.write_text(text, encoding="utf-8", newline="\n")

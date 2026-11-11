@@ -96,22 +96,31 @@ class SetupSession:
             )
         if bool(username) != bool(password):
             raise ConfigurationError("ログインIDとパスワードの両方を入力してください")
-        if not username and not self._credentials_stored():
-            raise ConfigurationError("ログインIDとパスワードを入力してください")
 
         with self._lock:
-            if username:
-                first_run.store_credentials(username, password, self.secret_store)
+            if self.done.is_set():
+                raise ConfigurationError("この設定フォームは保存済みです")
+            if not username and not self._credentials_stored():
+                raise ConfigurationError("ログインIDとパスワードを入力してください")
+            # Folders and config first, so a failure there leaves the keyring untouched.
             result = first_run.apply_setup(
                 plan,
                 config_path=self.config_path,
                 root=self.root,
                 force=True,
-                credentials_present=self._credentials_stored(),
+                credentials_present=True,
             )
+            if username:
+                first_run.store_credentials(username, password, self.secret_store)
             self.result = result
-        self.done.set()
+            self.done.set()
         return result
+
+
+class _Server(ThreadingHTTPServer):
+    # The default allows a second process to bind the same port on Windows.
+    allow_reuse_address = False
+    daemon_threads = True
 
 
 def _page(token: str) -> tuple[bytes, str]:
@@ -225,8 +234,7 @@ def _make_handler(session: SetupSession):
 
 
 def start_server(session: SetupSession) -> ThreadingHTTPServer:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(session))
-    server.daemon_threads = True
+    server = _Server(("127.0.0.1", 0), _make_handler(session))
     threading.Thread(target=server.serve_forever, name="uribo-setup-ui", daemon=True).start()
     return server
 
@@ -242,15 +250,22 @@ def run_setup_ui(
     initial: first_run.SetupPlan,
     open_browser: bool = True,
     timeout: float = 900.0,
+    secret_store=None,
+    announce=None,
 ) -> dict[str, Any]:
     """Serve the form until it is saved or ``timeout`` seconds pass."""
-    session = SetupSession(root=root, config_path=config_path, initial=initial)
+    session = SetupSession(
+        root=root, config_path=config_path, initial=initial, secret_store=secret_store
+    )
     server = start_server(session)
     url = setup_url(server, session)
     try:
-        # stderr keeps stdout clean for the final JSON result.
-        print(f"Setup form: {url}", file=sys.stderr, flush=True)
-        print("Waiting for the form to be saved in the browser...", file=sys.stderr, flush=True)
+        if announce is not None:
+            announce(url)
+        else:
+            # stderr keeps stdout clean for the final JSON result.
+            print(f"Setup form: {url}", file=sys.stderr, flush=True)
+            print("Waiting for the form to be saved in the browser...", file=sys.stderr, flush=True)
         if open_browser:
             try:
                 webbrowser.open(url)
