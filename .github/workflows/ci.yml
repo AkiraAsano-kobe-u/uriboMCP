@@ -48,6 +48,7 @@ jobs:
           if (Test-Path -LiteralPath "data") { throw "setup must not create data inside the project folder" }
           uv run uribo-mcp setup --no-ui --storage-dir $store
           if ($LASTEXITCODE -ne 2) { throw "a second setup without --force must be refused" }
+          $global:LASTEXITCODE = 0
       - name: Doctor
         run: |
           uv run uribo-mcp doctor

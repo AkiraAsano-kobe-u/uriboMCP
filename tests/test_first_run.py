@@ -187,7 +187,8 @@ def test_cli_setup_from_flags_is_non_interactive(tmp_path: Path, capsys) -> None
     code = main(["--root", str(root), "setup", "--no-ui", "--storage-dir", str(tmp_path / "other")])
     assert code == 2
     assert "--force" in json.loads(capsys.readouterr().out)["error"]
-    assert str(store) in (root / "config.local.toml").read_text(encoding="utf-8")
+    kept = tomllib.loads((root / "config.local.toml").read_text(encoding="utf-8"))
+    assert kept["paths"]["data_dir"] == str(store / "data")
 
 
 def test_cli_setup_without_terminal_or_folder_explains_what_is_missing(
