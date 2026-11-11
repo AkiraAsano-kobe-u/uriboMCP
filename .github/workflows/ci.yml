@@ -10,12 +10,57 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.14"
       - run: uv sync --locked --extra dev
+      - run: uv run ruff check .
       - run: uv run pytest
+
+  # The documented install path on a stock Windows: Windows PowerShell 5.1,
+  # a storage folder with Japanese characters and a space, no university access.
+  windows-install:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked
+      - name: Setup from flags
+        run: |
+          $store = Join-Path $env:RUNNER_TEMP "uribo データ"
+          uv run uribo-mcp setup --no-ui --storage-dir $store --sources csi,newsnet
+          if ($LASTEXITCODE -ne 0) { throw "setup failed" }
+          foreach ($path in @("config.local.toml", (Join-Path $store "data\logs"), (Join-Path $store "exports"), (Join-Path $store "credentials"))) {
+            if (-not (Test-Path -LiteralPath $path)) { throw "missing: $path" }
+          }
+          if (Test-Path -LiteralPath "data") { throw "setup must not create data inside the project folder" }
+          uv run uribo-mcp setup --no-ui --storage-dir $store
+          if ($LASTEXITCODE -ne 2) { throw "a second setup without --force must be refused" }
+      - name: Doctor
+        run: |
+          uv run uribo-mcp doctor
+          if ($LASTEXITCODE -ne 0) { throw "doctor failed" }
+          $store = Join-Path $env:RUNNER_TEMP "uribo データ"
+          if (-not (Test-Path -LiteralPath (Join-Path $store "data\uribo.db"))) { throw "database was not created in the chosen folder" }
+      - name: Scheduled sync tasks
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\Install-ScheduledSync.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Install-ScheduledSync.ps1 failed" }
+          $tasks = @(Get-ScheduledTask -TaskName "UriboMCP-AllSync", "UriboMCP-BeefSync")
+          if ($tasks.Count -ne 2) { throw "expected two scheduled tasks" }
+          foreach ($task in $tasks) {
+            if (-not (Test-Path -LiteralPath $task.Actions[0].Execute)) { throw "task executable is missing" }
+          }
+          Unregister-ScheduledTask -TaskName "UriboMCP-AllSync", "UriboMCP-BeefSync" -Confirm:$false

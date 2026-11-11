@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import date
 from pathlib import Path
 
@@ -20,6 +21,8 @@ from uribo_mcp.moodle.sync import MoodleSynchronizer, attachment_key
 from uribo_mcp.repository import Repository
 
 BASE = "https://beef.center.kobe-u.ac.jp/2026"
+# Optional saved pages from a real course; the tests that use them skip without it.
+LIVE_SAMPLES = Path(os.environ.get("URIBO_MCP_LIVE_SAMPLES", "live-samples"))
 
 # Shape copied from a live Moodle 4.5 course page (classic theme), text replaced.
 COURSE_HTML = f"""
@@ -448,7 +451,7 @@ def test_parse_course_page_and_enrolled_course() -> None:
 
 
 def test_parse_course_page_on_live_sample_if_present() -> None:
-    sample = Path("/Users/asanoakira/.hermes/cache/scratch/beefbeef/course_6328.html")
+    sample = LIVE_SAMPLES / "course_6328.html"
     if not sample.exists():
         pytest.skip("live sample not available on this machine")
     page = parse_course_page(sample.read_text(encoding="utf-8"), base_url=BASE)
@@ -747,7 +750,7 @@ def test_course_ids_filter_skips_other_courses_and_unenrolment(tmp_path: Path) -
 def test_live_empty_forum_is_recognised_and_discussion_chrome_is_not_a_body() -> None:
     from uribo_mcp.moodle.parser import parse_forum_discussion
 
-    sample = Path("/Users/asanoakira/.hermes/cache/scratch/beefbeef/forum_16327.html")
+    sample = LIVE_SAMPLES / "forum_16327.html"
     if sample.exists():
         html = sample.read_text(encoding="utf-8")
         assert parse_forum_discussions(html, base_url=BASE)["recognized"]

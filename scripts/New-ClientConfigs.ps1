@@ -46,7 +46,7 @@ if (-not (Test-Path -LiteralPath $projectRootFull -PathType Container)) {
 if (-not (Test-Path -LiteralPath (Join-Path $projectRootFull "pyproject.toml") -PathType Leaf)) {
     throw "ProjectRoot must contain pyproject.toml: '$projectRootFull'."
 }
-if (-not [System.IO.Path]::IsPathFullyQualified($configPathFull)) {
+if (-not [System.IO.Path]::IsPathRooted($configPathFull)) {
     throw "ConfigPath must resolve to an absolute path."
 }
 

@@ -78,16 +78,21 @@ def test_scripts_are_present_and_do_not_modify_user_client_configurations() -> N
 
 @pytest.mark.skipif(
     sys.platform != "win32",
-    reason="Windows client-material generation; asserts a project root with Japanese characters",
+    reason="Windows client-material generation",
 )
-def test_generator_and_doctor_preserve_absolute_unicode_paths(tmp_path: Path) -> None:
-    powershell = shutil.which("pwsh") or shutil.which("powershell")
+@pytest.mark.parametrize("shell", ["pwsh", "powershell"])
+def test_generator_and_doctor_preserve_absolute_unicode_paths(tmp_path: Path, shell: str) -> None:
+    # "powershell" is Windows PowerShell 5.1, the only one a stock Windows has.
+    powershell = shutil.which(shell)
     if not powershell:
-        pytest.skip("PowerShell is required for Windows client-material generation")
+        pytest.skip(f"{shell} is not installed")
 
-    # The project root itself contains Japanese characters and a space in this test environment.
+    project = tmp_path / "神戸大学 プロジェクト"
+    project.mkdir()
+    shutil.copy2(ROOT / "pyproject.toml", project / "pyproject.toml")
+    config = project / "config.local.toml"
+    shutil.copy2(ROOT / "config.example.toml", config)
     generated = tmp_path / "設定 出力"
-    config = ROOT / "config.example.toml"
     generator = ROOT / "scripts" / "New-ClientConfigs.ps1"
     doctor = ROOT / "scripts" / "Test-UriboMcpSetup.ps1"
 
@@ -95,10 +100,12 @@ def test_generator_and_doctor_preserve_absolute_unicode_paths(tmp_path: Path) ->
         [
             powershell,
             "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
             "-File",
             str(generator),
             "-ProjectRoot",
-            str(ROOT),
+            str(project),
             "-ConfigPath",
             str(config),
             "-OutputDirectory",
@@ -106,13 +113,11 @@ def test_generator_and_doctor_preserve_absolute_unicode_paths(tmp_path: Path) ->
         ],
         check=True,
         capture_output=True,
-        text=True,
-        encoding="utf-8",
     )
 
     desktop = json.loads((generated / "claude_desktop_config.json").read_text(encoding="utf-8"))
     server = desktop["mcpServers"]["uribo-mcp"]
-    assert server["args"][1] == str(ROOT)
+    assert server["args"][1] == str(project)
     assert server["env"]["URIBO_MCP_CONFIG"] == str(config)
     assert "神戸大学" in server["args"][1]
     assert (generated / "register-claude-code-user.ps1").is_file()
@@ -122,21 +127,23 @@ def test_generator_and_doctor_preserve_absolute_unicode_paths(tmp_path: Path) ->
         [
             powershell,
             "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
             "-File",
             str(doctor),
             "-ProjectRoot",
-            str(ROOT),
+            str(project),
             "-ConfigPath",
             str(config),
             "-GeneratedDirectory",
             str(generated),
         ],
-        check=True,
         capture_output=True,
-        text=True,
-        encoding="utf-8",
     )
-    assert json.loads(doctor_result.stdout)["Passed"] is True
+    # Windows PowerShell 5.1 writes its console output in the OEM code page.
+    output = doctor_result.stdout.decode("utf-8", errors="replace")
+    assert doctor_result.returncode == 0, output
+    assert '"Passed":  true' in output or '"Passed": true' in output
 
 
 def test_documentation_covers_all_three_clients_and_mcpb() -> None:

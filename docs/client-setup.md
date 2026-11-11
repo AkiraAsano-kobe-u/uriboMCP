@@ -10,13 +10,13 @@ Every client must receive an absolute `URIBO_MCP_CONFIG` path. Do not put BEEF+,
 
 ## Prepare a local configuration
 
-From the project root, create the untracked local file once. This command never overwrites an existing file.
+From the project root, run the setup once. It asks where local data should be stored and writes the untracked `config.local.toml`; its JSON output contains the exact `mcp_server` entry (command, arguments and `URIBO_MCP_CONFIG`) for this machine.
 
 ```powershell
-Copy-Item -LiteralPath .\config.example.toml -Destination .\config.local.toml -ErrorAction Stop
+uv run uribo-mcp setup
 ```
 
-Edit `config.local.toml` only as needed. Keep secrets in the configured credential store rather than in a desktop-client configuration.
+Keep secrets in the OS credential store rather than in a desktop-client configuration.
 
 Generate client-specific materials with argument arrays and absolute paths. This is safe for Japanese and space-containing paths, such as an OneDrive project directory, and does not change Claude/Codex settings.
 

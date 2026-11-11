@@ -1,172 +1,178 @@
 # uriboMCP
 
-神戸大学の個人向け情報をローカルに同期し、Claude Code、Claude Desktop、
-Codex Desktopから同じstdio MCPサーバーとして参照する独立プロジェクトです。
-旧 `KOBEDAI_dash` のデータや資格情報には実行時依存しません。
+神戸大学システム情報学部の学生向けの、ローカルで動く MCP サーバーです。
+BEEF+ の授業資料・課題・お知らせ、うりぼーネットの掲示、学部サイトのお知らせなどを
+自分の PC に同期し、Claude Code・Claude Desktop・Codex から
+「今日の時間割は？」「締切の近い課題は？」「第 3 回の資料の要点は？」のように聞けるようにします。
 
-主な機能:
+- 対象: 神戸大学システム情報学部の学生（Windows 10 / 11）
+- 大学非公式の個人開発ツールです。神戸大学とは関係がありません
+- 同期したデータは自分の PC にだけ保存します
 
-- BEEF+、BEEF+ Venture、システム情報学部、学年暦PDF、Newsnet、
-  うりぼーネット、大学メールの取得ロジック
-- 時間割、締切、お知らせ、教材、課題詳細のローカルSQLite保存
-- PDF、DOCX、PPTX、XLSX、TXT、CSV、画像の本文抽出と横断検索
-- Tesseract/Popplerがある環境でのスキャンPDF・画像OCR
-- 新規／更新／非公開化の履歴とローカル通知
-- ページ引用つき学習コンテキスト作成、教材の整理エクスポート
-- 複数デスクトップクライアントで共有できるバックグラウンド同期ジョブ
+## インストール
 
-## 安全境界
+### AI に任せる（おすすめ）
 
-このサーバーは設定した本人のアカウントだけを対象とするローカルツールです。
-テスト、アンケート、出席は一覧上の状態と期限だけを保存し、開始・回答・登録URLを
-呼びません。課題は詳細ページをGETで読むだけで、提出操作を行いません。
-認証試行はCookie復元失敗後の1回だけです。
+Claude Code や Codex など、PC 上でコマンドを実行できる AI エージェントに次の文を貼ります。
 
-大学IDとパスワードはOSの資格情報ストアに保存します。LMS CookieはWindowsでは
-DPAPIで暗号化します。Google OAuthトークン、DB、教材キャッシュ、エクスポートは
-すべてgit管理外です。
+```text
+https://github.com/AkiraAsano-kobe-u/uriboMCP の docs/install-for-agents.md を読んで、
+その手順どおりに uriboMCP をこの PC にインストールして。
+```
+
+AI がインストール先とデータの保存先を尋ね、途中でブラウザに設定フォームを開きます。
+大学のログイン ID とパスワードはそのフォームに自分で入力します（AI には渡りません）。
+
+### 手動でインストール
+
+必要なもの: [Git](https://git-scm.com/)、[uv](https://docs.astral.sh/uv/)、Google Chrome。
+Python は uv が自動で用意します。
+
+```powershell
+winget install --id Git.Git -e
+winget install --id astral-sh.uv -e
+
+git clone https://github.com/AkiraAsano-kobe-u/uriboMCP.git "$env:USERPROFILE\uriboMCP"
+cd "$env:USERPROFILE\uriboMCP"
+uv sync
+
+uv run uribo-mcp setup            # 保存先・同期する情報・大学アカウントを設定
+uv run uribo-mcp doctor           # 環境の確認
+uv run uribo-mcp refresh --wait   # 最初の同期（初回は数十分かかることがあります）
+```
+
+続けて [MCP クライアントへ登録](#mcp-クライアントへ登録) します。
 
 ## セットアップ
 
-Python 3.11以上と `uv` を前提にしています。
+`uv run uribo-mcp setup` はブラウザに設定フォームを開きます。
+
+- データの保存先と、教材の書き出し先
+- 同期する情報
+- 神戸大学アカウント（OS の資格情報ストアに保存）
+
+保存先は OneDrive などクラウド同期の配下を避けてください。データベースが壊れることがあります。
+設定は `config.local.toml` に書かれ、同じコマンドでいつでも変更できます。
+
+フォームを使わずに指定することもできます。
+
+```powershell
+uv run uribo-mcp setup --no-ui --storage-dir "D:\uriboMCP-data" --sources beef,uribo,csi
+uv run uribo-mcp auth setup       # 大学アカウントをターミナルで入力
+```
+
+| オプション | 内容 | 既定 |
+| --- | --- | --- |
+| `--storage-dir` | すべてのデータの基準フォルダ | `%USERPROFILE%\uriboMCP-data` |
+| `--data-dir` | データベースとログ | `<storage>\data` |
+| `--cache-dir` | ダウンロードした教材 | `<data>\cache` |
+| `--export-dir` | 教材の書き出し先 | `<storage>\exports` |
+| `--credentials-dir` | ログイン Cookie と OAuth ファイル | `<storage>\credentials` |
+| `--sources` | 同期する情報（カンマ区切り） | 下表の「有効」 |
+| `--force` | 既存の設定を置き換える（元のファイルは `.bak` に残る） | |
+
+同期できる情報:
+
+| ID | 内容 | 既定 |
+| --- | --- | --- |
+| `beef` | BEEF+ の授業資料・課題・お知らせ・時間割 | 常に有効 |
+| `uribo` | うりぼーネットの掲示 | 有効 |
+| `csi` | システム情報学部サイトの在学生向けお知らせ | 有効 |
+| `pdf_calendar` | 学年暦 | 有効 |
+| `newsnet` | 神戸大学ニュースネット | 有効 |
+| `venture` | BEEF+ Venture（特定の 1 コースのみ対応） | 無効 |
+| `moodle` | LMS BEEF（Moodle） | 無効 |
+| `mail` | 大学メール | 無効 |
+
+大学メールを同期するには、Google Cloud で自分用の Desktop OAuth クライアントを作り、
+`<credentials>\google_client_secret.json` に置いてから `uv run uribo-mcp auth google` を一度実行します。
+
+OCR は任意です。画像やスキャン PDF を読むには Tesseract（日本語データ）、PDF の OCR には
+加えて Poppler の `pdftoppm` を PATH に置きます。無くても文字入り PDF と Office 文書は読めます。
+
+## MCP クライアントへ登録
+
+`uv run uribo-mcp setup` の出力にある `config_path` を使います。
+
+```powershell
+# Claude Code
+claude mcp add --transport stdio uribo-mcp --scope user `
+  --env "URIBO_MCP_CONFIG=C:\Users\you\uriboMCP\config.local.toml" -- `
+  uv --directory "C:\Users\you\uriboMCP" run uribo-mcp serve
+
+# Codex
+codex mcp add uribo-mcp `
+  --env "URIBO_MCP_CONFIG=C:\Users\you\uriboMCP\config.local.toml" -- `
+  uv --directory "C:\Users\you\uriboMCP" run uribo-mcp serve
+```
+
+Claude Desktop と MCPB バンドルの手順は [docs/client-setup.md](docs/client-setup.md) にあります。
+
+## 定期同期
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\Install-ScheduledSync.ps1
+```
+
+Windows タスクスケジューラに、全情報を毎日 7:00、BEEF+ を 8:00〜23:00 の 3 時間ごとに
+同期するタスク（`UriboMCP-AllSync`、`UriboMCP-BeefSync`）を登録します。
+ウィンドウは表示されず、入力フォーカスも奪いません。Windows にログオンしている間だけ動きます。
+変更のない教材は再取得しません。ログは `<data>\logs` に残ります。
+
+## 安全のための設計
+
+- 自分のアカウントだけを対象にし、読み取りしかしません。課題の提出、テスト・アンケートの
+  開始や回答、出席登録、フォーラムへの投稿は行いません（一覧上の状態と期限だけを記録します）
+- 大学のログイン ID とパスワードは OS の資格情報ストアに、ログイン Cookie は Windows の DPAPI で
+  暗号化して保存します。設定ファイルや MCP クライアントの設定には書きません
+- 大学のサーバーへのリクエストは既定で 3 秒の間隔を空け、ログインの試行は Cookie が切れたときの 1 回だけです
+- 教材ページを開くため、BEEF+ 側に閲覧記録が残ります。「閲覧で完了」の活動は完了扱いになることがあります
+
+## 利用上の注意
+
+- 神戸大学の情報セキュリティポリシーと各システムの利用規則に従って、自己責任で使ってください
+- 授業資料の著作権は担当教員などにあります。同期した資料を許可なく共有・公開しないでください
+- AI クライアントに資料を読ませると、その内容は利用している AI サービスに送られます。
+  各サービスのデータの扱いを確認してください
+- 大学側のページ構成が変わると同期できなくなることがあります。`get_source_health` と
+  `<data>\logs` で状態を確認できます
+
+## MCP ツール
+
+時間割・締切・お知らせ:
+`get_today` `get_week` `get_deadlines` `get_unread` `get_news` `get_notes` `get_item`
+`get_course` `search_items` `mark_done` `get_source_health`
+
+授業と教材:
+`list_courses` `list_course_content` `get_course_content` `search_course_content`
+`read_document` `build_study_context` `export_materials` `get_changes`
+`get_notifications` `acknowledge_notifications` `start_refresh` `get_refresh_status`
+
+検索と応答サイズの仕様は [docs/tool-contract.md](docs/tool-contract.md) にあります。
+
+## LMS BEEF（Moodle）の同期
+
+BEEF+ とは別の Moodle サイト `https://beef.center.kobe-u.ac.jp/<年度>/` の登録コースから、
+教材・課題・お知らせ・締切を取り込めます。セットアップで `moodle` を有効にします。
+
+- 読み取り専用です。小テスト・アンケート・出席はページを開かず、名前と期限だけを記録します
+- 動画・音声ファイルは名前だけを記録し、ダウンロードしません
+- 同じ年度・時間割コードの BEEF+ コースが 1 件だけあれば、その授業にまとめて保存します
+- 提出状況は記録するだけで、完了チェックは変更しません
+- 保存済み Cookie を優先し、切れていれば KNOSSOS に 1 回だけログインします
+- フォーラム（お知らせ）の読み取りは、投稿のある実ページでは未検証です
+
+## 開発
 
 ```powershell
 uv sync --extra dev
-Copy-Item config.example.toml config.local.toml
-uv run uribo-mcp auth setup
-uv run uribo-mcp doctor
-```
-
-大学メールも同期する場合は、Google Cloudで作成したDesktop OAuthクライアントを
-`credentials/google_client_secret.json` に置き、対話端末で次を一度実行します。
-
-```powershell
-uv run uribo-mcp auth google
-```
-
-初回同期:
-
-```powershell
-uv run uribo-mcp refresh --wait
-```
-
-OCRは任意です。画像・スキャンPDFを読むにはTesseract（日本語言語データ）を、
-PDF OCRには加えてPopplerの `pdftoppm` をPATH上に用意します。未導入でも、
-文字レイヤー付きPDFとOffice文書の抽出は動作します。
-
-## MCPクライアントへの登録
-
-日本語や空白を含むこのプロジェクトの絶対パスを安全に登録するため、設定生成
-スクリプトを利用してください。実際のユーザー設定は自動変更しません。
-
-```powershell
-pwsh -File .\scripts\New-ClientConfigs.ps1
-```
-
-Claude Code、Claude Desktop、Codex Desktopそれぞれの登録方法とMCPB作成方法は
-[docs/client-setup.md](docs/client-setup.md) を参照してください。
-
-## MCPツール
-
-旧互換ツール:
-
-`get_today`、`get_deadlines`、`search_items`、`mark_done`、`get_unread`、
-`get_notes`、`get_news`、`get_item`、`get_week`、`get_course`、
-`get_source_health`
-
-授業・教材ツール:
-
-`list_courses`、`list_course_content`、`get_course_content`、
-`search_course_content`、`read_document`、`get_changes`、
-`get_notifications`、`acknowledge_notifications`、`build_study_context`、
-`export_materials`、`start_refresh`、`get_refresh_status`
-
-長い同期は `start_refresh` が即座にjob IDを返します。
-完了確認は `get_refresh_status` をポーリングしてください。
-
-### 検索と応答サイズの契約
-
-一覧の `fields` は後方互換のため `"full"` が既定です。必要な基本項目だけに
-絞る場合は `fields="summary"` を明示してください。検索の `include_text` も
-既定は `true`（全文）です。`include_text=false` を指定すると、文書結果は
-原文snippetと `text_chars` を保ったまま全文 `text` を省略します。
-`build_study_context` の引用本文はこの軽量化に置き換わりません。
-
-公開するitemの `metadata.attachment_manifest` からは、内部ダウンロード用の
-`object_name` を除去します。これは意図的な応答互換性変更で、`fields="full"` や
-全文検索でも同キーは返しません。同キーを参照していたクライアントは、公開の
-attachment IDと `read_document` 等を使うよう変更してください。DBに保存された
-manifest、同期処理、教材ファイルは変更しません。この除去はmanifest内の辞書項目に
-限定され、他のmetadataを再帰的に秘匿化するものではありません。
-
-検索はNFKC whole-string正規化・casefold・空白正規化による部分文字列一致です。
-複数語で全語一致があればそれのみを返し、無ければANY（一致語数→score）へ
-フォールバックします。これは旧来の厳密ANDのみの検索からの意図的な意味変更です。
-`tokens_unmatched` はlimit適用前の検索スコープ（授業・種類・公開状態等）内で
-無一致の語です。他授業・未同期・非公開資料を含む資料不存在の証明ではありません。
-重複語は一致語数には数えませんが、従来同様scoreには重複分を反映します。
-多数語はSQL式サイズを制御してPython scanに切り替え、語を切り捨てません。
-
-readonly接続は全経路で `query_only=1`、reader timeout 5秒を適用します。
-未作成・旧schema・不正versionでは初期化用writerが必要ですが、callerへのyield前に
-readerへ切り替えます。schema検査のロック・I/O・破損例外はmigrationへ逃がしません。
-
-## Windowsでの定期同期
-
-Windowsタスクスケジューラへ、全ソースを毎日07:00、BEEF+を
-08:00から23:00まで3時間ごとに同期するタスクを登録できます。
-`pythonw.exe` と非表示ワーカーを使用し、PDF変換・OCR・ChromeDriverにも
-`CREATE_NO_WINDOW` と `SW_HIDE` を適用するため、実行時にコンソール
-ウィンドウは表示されず、入力フォーカスも変更しません。
-
-```powershell
-pwsh -File .\scripts\Install-ScheduledSync.ps1
-```
-
-登録されるタスクは `UriboMCP-AllSync` と `UriboMCP-BeefSync` です。
-重複した同期は開始されず、起動履歴は `data/logs/scheduler.log`、
-各同期の詳細ログは `data/logs/<job-id>.log` に記録されます。
-教材キャッシュはBEEF+の `objectName` とローカルファイルのサイズを確認し、
-新規・更新・欠損時だけ再取得します。変更のない教材はダウンロード、本文抽出、
-ファイル保存を省略するため、OneDrive上の全教材を毎回書き換えません。
-同期結果の `attachments_reused` で再利用件数を確認できます。
-パスワードを保存しない構成のため、タスクは現在のユーザーが
-Windowsへログオン中にバックグラウンド実行されます。
-
-## LMS BEEF（Moodle）の同期（任意）
-
-BEEF+ とは別の Moodle サイト `https://beef.center.kobe-u.ac.jp/<年度>/` の
-登録コースから、教材・課題・お知らせ・締切を取り込めます。既定では無効で、
-`config.local.toml` の `enabled_sources` に `"moodle"` を加えると有効になります。
-
-- 読み取り専用です。小テスト・アンケート・出席はページを開かず、名前と期限だけを記録します。
-  課題の提出、フォーラムへの投稿、編集操作は行いません。
-- 教材ページ（ファイル・ページ・フォルダ・課題）を開くため、Moodle 側に閲覧ログが残り、
-  「閲覧で完了」が設定された活動は完了扱いになることがあります（BEEF+ の同期と同じ性質）。
-- 動画・音声ファイルは名前だけを記録し、ダウンロードしません。
-- 同じ年度・時間割コードの BEEF+ コースが1件だけあれば、その授業にまとめて保存します。
-- 提出状況は記録するだけで、完了チェック（`is_done`）は変更しません。
-- 保存済み Cookie を優先し、切れていれば KNOSSOS に1回だけログインします。
-  同じ同期の中で別ソースのログインが失敗していれば、Moodle のログインは試みません。
-- フォーラム（お知らせ）の読み取りは、投稿のある実ページでは未検証です。
-  見慣れない構造のページでは既存のお知らせを消さずに残します。
-
-## 旧データの移行
-
-旧DBは読み取り専用で開き、データだけを新DBへコピーします。認証情報やCookieは
-コピーしません。
-
-```powershell
-uv run uribo-mcp import-legacy --from "C:\path\to\KOBEDAI_dash\data\app.db"
-```
-
-## 開発時の検証
-
-```powershell
 uv run pytest
 uv run ruff check .
-uv build
 ```
 
-実サイトのHTML構造やSSO状態は変わりうるため、初回実機同期後は
-`get_source_health` と `data/logs/<job-id>.log` を確認してください。
+不具合の報告や改善の提案は Issue へどうぞ。`csi` 以外は学部に依存しない作りですが、
+システム情報学部以外では未検証です。
+
+## ライセンス
+
+[MIT License](LICENSE)

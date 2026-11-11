@@ -33,7 +33,7 @@
     "config_path": {
       "type": "file",
       "title": "uriboMCP configuration file",
-      "description": "Select your local config.local.toml. It must not contain credentials in this bundle.",
+      "description": "Select the config.local.toml written by `uribo-mcp setup`.",
       "required": true
     }
   },

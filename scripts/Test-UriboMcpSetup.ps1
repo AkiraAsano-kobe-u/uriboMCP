@@ -48,7 +48,7 @@ if ($GeneratedDirectory) {
         Add-Check -Name "Claude Desktop JSON" -Passed (Test-Path -LiteralPath $desktopPath -PathType Leaf) -Detail $desktopPath
         if (Test-Path -LiteralPath $desktopPath -PathType Leaf) {
             try {
-                $desktop = Get-Content -LiteralPath $desktopPath -Raw | ConvertFrom-Json
+                $desktop = Get-Content -LiteralPath $desktopPath -Raw -Encoding UTF8 | ConvertFrom-Json
                 $server = $desktop.mcpServers."uribo-mcp"
                 $matches = $server.args[1] -eq $projectRootFull -and $server.env.URIBO_MCP_CONFIG -eq $configPathFull
                 Add-Check -Name "Claude Desktop generated paths" -Passed $matches -Detail "Expected generated absolute paths"

@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>uriboMCP セットアップ</title>
+<style nonce="__NONCE__">
+  :root {
+    --bg: #fafafa; --card: #ffffff; --raised: #f4f4f5;
+    --text: #171717; --text-2: #525252; --text-3: #737373;
+    --line: rgba(23, 23, 23, 0.1); --line-strong: rgba(23, 23, 23, 0.22);
+    --accent: #9a4a12; --on-fill: #ffffff; --negative: #dc2626;
+    --ease: cubic-bezier(0.22, 1, 0.36, 1);
+    --sans: "Segoe UI", "Yu Gothic UI", "Hiragino Sans", "Noto Sans JP", system-ui, sans-serif;
+    --mono: "Cascadia Mono", Consolas, "SFMono-Regular", Menlo, ui-monospace, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141415; --card: #19191b; --raised: #232325;
+      --text: #ededed; --text-2: #a1a1a6; --text-3: #85858b;
+      --line: rgba(237, 237, 237, 0.1); --line-strong: rgba(237, 237, 237, 0.24);
+      --accent: #e0a070; --on-fill: #141415; --negative: #e5484d;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 400 14px/20px var(--sans); -webkit-font-smoothing: antialiased;
+  }
+  .page { max-width: 1040px; padding: 32px; }
+  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 40px; }
+  .wordmark { font-size: 17px; font-weight: 600; }
+  .context { color: var(--text-3); }
+  main { display: grid; grid-template-columns: minmax(0, 480px) minmax(0, 1fr); gap: 64px; align-items: start; }
+  section + section { margin-top: 32px; }
+  h2 { margin: 0 0 12px; font-size: 14px; line-height: 20px; font-weight: 600; }
+  .field ~ .field { margin-top: 12px; }
+  label.name { display: block; margin-bottom: 4px; font-size: 13px; color: var(--text-2); }
+  input[type="text"], input[type="password"] {
+    width: 100%; height: 40px; padding: 0 12px;
+    background: var(--card); color: var(--text);
+    border: 1px solid var(--line-strong); border-radius: 8px;
+    font: 400 14px/20px var(--sans);
+    transition: border-color 140ms var(--ease);
+  }
+  input.path { font-family: var(--mono); font-size: 13px; }
+  input::placeholder { color: var(--text-3); }
+  input:hover { border-color: var(--text-3); }
+  input:focus-visible, button:focus-visible, .source input:focus-visible + .box {
+    outline: 2px solid var(--accent); outline-offset: 2px;
+  }
+  .sources { border: 1px solid var(--line); border-radius: 12px; background: var(--card); padding: 4px; }
+  .source {
+    display: grid; grid-template-columns: 16px minmax(0, auto) minmax(0, 1fr); align-items: center;
+    column-gap: 12px; height: 36px; padding: 0 8px; border-radius: 8px; cursor: pointer;
+    transition: background-color 140ms var(--ease);
+  }
+  .source:hover { background: var(--raised); }
+  .source input { position: absolute; opacity: 0; pointer-events: none; }
+  .box {
+    width: 16px; height: 16px; border: 1px solid var(--line-strong); border-radius: 4px;
+    display: grid; place-items: center; color: transparent; background: var(--card);
+    transition: background-color 140ms var(--ease), border-color 140ms var(--ease);
+  }
+  .source input:checked + .box { background: var(--accent); border-color: var(--accent); color: var(--on-fill); }
+  .source input:disabled + .box { opacity: 0.55; }
+  .source.locked { cursor: default; }
+  .source .note { color: var(--text-3); font-size: 13px; text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .line { display: flex; align-items: flex-start; gap: 8px; margin-top: 8px; font-size: 13px; color: var(--text-2); }
+  .line svg { flex: none; margin-top: 2px; color: var(--text-3); }
+  .line.caution svg, .line.error, .line.error svg { color: var(--negative); }
+  .actions { margin-top: 32px; display: flex; align-items: center; gap: 16px; }
+  button.primary {
+    height: 44px; padding: 0 20px; border: 0; border-radius: 8px; cursor: pointer;
+    background: var(--text); color: var(--bg); font: 500 14px/20px var(--sans);
+    transition: opacity 140ms var(--ease), transform 140ms var(--ease);
+  }
+  button.primary:hover { opacity: 0.88; }
+  button.primary:active { transform: scale(0.98); }
+  button.primary:disabled { opacity: 0.5; cursor: default; }
+  aside { position: sticky; top: 32px; }
+  .tree { border: 1px solid var(--line); border-radius: 12px; background: var(--card); padding: 20px; font: 400 13px/24px var(--mono); overflow-x: auto; }
+  .tree .root { color: var(--text); word-break: break-all; line-height: 20px; }
+  .tree .root + .root, .tree .rows + .root { margin-top: 16px; }
+  .tree .sep { color: var(--text-3); }
+  .rows { margin: 8px 0 0; padding: 0; list-style: none; }
+  .rows li { display: grid; column-gap: 8px; align-items: center; white-space: nowrap; }
+  .rows li.d1 { padding-left: 4px; grid-template-columns: 16px 112px 1fr; }
+  .rows li.d2 { padding-left: 28px; grid-template-columns: 16px 88px 1fr; }
+  .rows svg { color: var(--text-3); }
+  .rows .what { color: var(--text-3); font-family: var(--sans); }
+  .done h1 { margin: 0 0 12px; font-size: 28px; line-height: 1.15; font-weight: 500; }
+  .done .mono { font: 400 13px/20px var(--mono); color: var(--text-2); word-break: break-all; }
+  [hidden] { display: none !important; }
+  @media (max-width: 820px) {
+    .page { padding: 24px 20px; }
+    main { grid-template-columns: minmax(0, 1fr); gap: 32px; }
+    aside { position: static; }
+  }
+</style>
+</head>
+<body>
+<svg width="0" height="0" hidden>
+  <symbol id="i-folder" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></symbol>
+</svg>
+
+<div class="page">
+  <header><span class="wordmark">uriboMCP</span><span class="context">セットアップ</span></header>
+
+  <main id="form-view">
+    <form id="form" novalidate autocomplete="off">
+      <section>
+        <h2>保存先</h2>
+        <div class="field">
+          <label class="name" for="storage">データ</label>
+          <input class="path" type="text" id="storage" spellcheck="false">
+        </div>
+        <div class="line caution" id="cloud" hidden>
+          <svg width="16" height="16"><use href="#i-alert"/></svg>
+          <span>クラウド同期フォルダではデータベースが壊れることがあります</span>
+        </div>
+        <div class="field">
+          <label class="name" for="export">教材の書き出し先</label>
+          <input class="path" type="text" id="export" spellcheck="false">
+        </div>
+      </section>
+
+      <section>
+        <h2>同期する情報</h2>
+        <div class="sources" id="sources"></div>
+      </section>
+
+      <section>
+        <h2>神戸大学アカウント</h2>
+        <div class="field">
+          <label class="name" for="username">ログインID</label>
+          <input type="text" id="username" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label class="name" for="password">パスワード</label>
+          <input type="password" id="password" autocomplete="new-password">
+        </div>
+        <div class="line">
+          <svg width="16" height="16"><use href="#i-lock"/></svg>
+          <span>この PC の資格情報ストアだけに保存</span>
+        </div>
+      </section>
+
+      <div class="actions">
+        <button class="primary" type="submit" id="save">設定を保存</button>
+      </div>
+      <div class="line error" id="error" role="alert" hidden>
+        <svg width="16" height="16"><use href="#i-alert"/></svg>
+        <span id="error-text"></span>
+      </div>
+    </form>
+
+    <aside>
+      <h2>作成されるフォルダ</h2>
+      <div class="tree" id="tree"></div>
+    </aside>
+  </main>
+
+  <div class="done" id="done-view" hidden>
+    <h1>保存しました</h1>
+    <div class="mono" id="done-path"></div>
+    <div class="line"><span>このタブを閉じて、インストールを続けてください</span></div>
+  </div>
+</div>
+
+<script nonce="__NONCE__">
+(() => {
+  const TOKEN = "__TOKEN__";
+  const $ = (id) => document.getElementById(id);
+  let state = null;
+  let exportFollows = true;
+
+  const api = async (path, body) => {
+    const response = await fetch(path, {
+      method: body ? "POST" : "GET",
+      headers: { "X-Uribo-Setup-Token": TOKEN, ...(body ? { "Content-Type": "application/json" } : {}) },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "保存できませんでした");
+    return data;
+  };
+
+  const trimSep = (path) => path.replace(/[\\/]+$/, "");
+  const join = (base, name) => trimSep(base) + state.sep + name;
+  const el = (tag, cls, text) => {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  };
+  const icon = (name) => {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("width", "16"); svg.setAttribute("height", "16");
+    const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+    use.setAttribute("href", "#i-" + name);
+    svg.append(use);
+    return svg;
+  };
+  const rootLine = (path) => {
+    const line = el("div", "root");
+    path.split(/([\\/])/).forEach((part) => {
+      if (part) line.append(/[\\/]/.test(part) ? el("span", "sep", part) : document.createTextNode(part));
+    });
+    return line;
+  };
+  const row = (depth, kind, name, what) => {
+    const li = el("li", "d" + depth);
+    li.append(icon(kind), el("span", "", name), el("span", "what", what || ""));
+    return li;
+  };
+
+  const exportDefault = () => join($("storage").value.trim() || state.storage_dir, "exports");
+
+  const renderTree = () => {
+    const storage = trimSep($("storage").value.trim());
+    const exportPath = trimSep($("export").value.trim());
+    const inside = exportPath === join(storage, "exports");
+    const tree = $("tree");
+    tree.replaceChildren();
+    if (!storage) return;
+    tree.append(rootLine(storage));
+    const rows = el("ul", "rows");
+    rows.append(
+      row(1, "folder", "data", ""),
+      row(2, "file", "uribo.db", "時間割・課題・お知らせ"),
+      row(2, "folder", "cache", "教材ファイル"),
+      row(2, "folder", "logs", "同期ログ"),
+      row(1, "folder", "credentials", "ログイン Cookie"),
+    );
+    if (inside) rows.append(row(1, "folder", "exports", "書き出した教材"));
+    tree.append(rows);
+    if (!inside && exportPath) {
+      tree.append(rootLine(exportPath));
+      const extra = el("ul", "rows");
+      extra.append(row(1, "folder", "授業名", "書き出した教材"));
+      tree.append(extra);
+    }
+    $("cloud").hidden = !/(^|[\\/])(onedrive|dropbox|google drive)/i.test(storage);
+  };
+
+  const renderSources = () => {
+    const list = $("sources");
+    list.replaceChildren();
+    state.sources.forEach((source) => {
+      const label = el("label", "source" + (source.required ? " locked" : ""));
+      const input = el("input");
+      input.type = "checkbox"; input.value = source.id;
+      input.checked = source.checked; input.disabled = source.required;
+      const box = el("span", "box");
+      const check = icon("check");
+      check.setAttribute("width", "12"); check.setAttribute("height", "12");
+      box.append(check);
+      label.append(input, box, el("span", "", source.label), el("span", "note", source.note));
+      list.append(label);
+    });
+  };
+
+  const showError = (message) => {
+    $("error-text").textContent = message;
+    $("error").hidden = !message;
+  };
+
+  $("storage").addEventListener("input", () => {
+    if (exportFollows) $("export").value = exportDefault();
+    renderTree();
+  });
+  $("export").addEventListener("input", () => {
+    exportFollows = $("export").value.trim() === "";
+    renderTree();
+  });
+  $("export").addEventListener("blur", () => {
+    if ($("export").value.trim() === "") { $("export").value = exportDefault(); exportFollows = true; renderTree(); }
+  });
+
+  $("form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    showError("");
+    const button = $("save");
+    button.disabled = true;
+    try {
+      const result = await api("/api/save", {
+        storage_dir: $("storage").value,
+        export_root: exportFollows ? "" : $("export").value,
+        sources: [...document.querySelectorAll("#sources input:checked")].map((input) => input.value),
+        username: $("username").value,
+        password: $("password").value,
+      });
+      $("password").value = "";
+      $("done-path").textContent = result.config_path;
+      $("form-view").hidden = true;
+      $("done-view").hidden = false;
+    } catch (error) {
+      showError(error.message);
+      button.disabled = false;
+    }
+  });
+
+  api("/api/state").then((data) => {
+    state = data;
+    $("storage").value = data.storage_dir;
+    $("export").value = data.export_root;
+    exportFollows = trimSep(data.export_root) === join(data.storage_dir, "exports");
+    if (data.credentials_stored) {
+      $("username").placeholder = "保存済み";
+      $("password").placeholder = "変更するときだけ入力";
+    }
+    renderSources();
+    renderTree();
+    $("storage").focus();
+  }).catch((error) => showError(error.message));
+})();
+</script>
+</body>
+</html>

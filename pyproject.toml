@@ -5,10 +5,11 @@ build-backend = "hatchling.build"
 [project]
 name = "uribo-mcp"
 version = "0.1.0"
-description = "Local MCP server for Kobe University course and campus information"
+description = "Local MCP server for Kobe University (Faculty of System Informatics) course and campus information"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "Private" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "uriboMCP contributors" }]
 dependencies = [
   "beautifulsoup4>=4.12",
@@ -28,6 +29,10 @@ dependencies = [
   "requests>=2.32",
   "selenium>=4.27",
 ]
+
+[project.urls]
+Repository = "https://github.com/AkiraAsano-kobe-u/uriboMCP"
+Issues = "https://github.com/AkiraAsano-kobe-u/uriboMCP/issues"
 
 [project.optional-dependencies]
 dev = [

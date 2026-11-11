@@ -36,8 +36,8 @@ Copy-Item -LiteralPath (Join-Path $projectRootFull "config.example.toml") -Desti
 Copy-Item -LiteralPath (Join-Path $projectRootFull "packaging\\mcpb\\.mcpbignore") -Destination (Join-Path $stagingRootFull ".mcpbignore")
 
 $manifestPath = Join-Path $projectRootFull "packaging\\mcpb\\manifest.json"
-$manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-$pyproject = Get-Content -LiteralPath (Join-Path $projectRootFull "pyproject.toml") -Raw
+$manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$pyproject = Get-Content -LiteralPath (Join-Path $projectRootFull "pyproject.toml") -Raw -Encoding UTF8
 if ($pyproject -match '(?m)^version\s*=\s*"([^"]+)"') {
     $manifest.version = $Matches[1]
 }

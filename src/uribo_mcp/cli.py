@@ -28,6 +28,28 @@ def _parser() -> argparse.ArgumentParser:
     auth_commands.add_parser("google", help="run Google OAuth for Gmail")
     auth_commands.add_parser("status", help="show setup state without secret values")
 
+    setup = commands.add_parser(
+        "setup",
+        help="choose storage folders and sources, and store the university login",
+        description=(
+            "Without options a local browser form opens for the storage folder, the "
+            "sources and the university login. With --no-ui the same values come from "
+            "flags (or terminal prompts) and the login is left to `auth setup`."
+        ),
+    )
+    setup.add_argument("--storage-dir", type=str, help="base folder for all local data")
+    setup.add_argument("--data-dir", type=str, help="database and logs (default: STORAGE/data)")
+    setup.add_argument("--cache-dir", type=str, help="downloaded files (default: DATA/cache)")
+    setup.add_argument("--export-dir", type=str, help="exports (default: STORAGE/exports)")
+    setup.add_argument(
+        "--credentials-dir", type=str, help="cookies and OAuth files (default: STORAGE/credentials)"
+    )
+    setup.add_argument("--sources", type=str, help="comma-separated source ids to sync")
+    setup.add_argument("--no-ui", action="store_true", help="do not open the browser form")
+    setup.add_argument("--no-browser", action="store_true", help="print the form URL only")
+    setup.add_argument("--force", action="store_true", help="replace an existing config")
+    setup.add_argument("--timeout", type=float, default=900.0, help="seconds to wait for the form")
+
     refresh = commands.add_parser("refresh", help="start a background refresh")
     refresh.add_argument("--scope", default="all")
     refresh.add_argument("--course-id", action="append", dest="course_ids")
@@ -53,10 +75,82 @@ def _settings(args):
 
 
 def _print(value) -> None:
-    print(json.dumps(value, ensure_ascii=False, indent=2, default=str))
+    text = json.dumps(value, ensure_ascii=False, indent=2, default=str)
+    try:
+        text.encode(sys.stdout.encoding or "utf-8")
+    except (UnicodeEncodeError, LookupError):
+        # A piped Windows console may not be able to show every character;
+        # escaped JSON stays valid for whatever reads it.
+        text = json.dumps(value, ensure_ascii=True, indent=2, default=str)
+    print(text)
+
+
+def run_setup(args) -> int:
+    """Write config.local.toml from flags, terminal prompts or the browser form."""
+    from uribo_mcp import first_run
+    from uribo_mcp.errors import UriboMcpError
+
+    root = (args.root or Path.cwd()).resolve()
+    selected = args.config or os.environ.get("URIBO_MCP_CONFIG")
+    if selected:
+        config_path = Path(selected).expanduser()
+        config_path = config_path if config_path.is_absolute() else root / config_path
+    else:
+        config_path = root / first_run.CONFIG_NAME
+    try:
+        previous = first_run.plan_from_existing(config_path, root)
+        if args.storage_dir:
+            initial = first_run.build_plan(
+                args.storage_dir,
+                data_dir=args.data_dir,
+                cache_dir=args.cache_dir,
+                export_root=args.export_dir,
+                credentials_dir=args.credentials_dir,
+                sources=args.sources or (previous.sources if previous else None),
+            )
+        else:
+            base = previous or first_run.build_plan(first_run.default_storage_dir())
+            initial = first_run.build_plan(
+                base.storage_dir,
+                data_dir=args.data_dir or base.data_dir,
+                cache_dir=args.cache_dir or base.cache_dir,
+                export_root=args.export_dir or base.export_root,
+                credentials_dir=args.credentials_dir or base.credentials_dir,
+                sources=args.sources or base.sources,
+            )
+        if not args.no_ui:
+            from uribo_mcp.first_run_ui import run_setup_ui
+
+            result = run_setup_ui(
+                root=root,
+                config_path=config_path,
+                initial=initial,
+                open_browser=not args.no_browser,
+                timeout=args.timeout,
+            )
+        else:
+            if not args.storage_dir:
+                if not sys.stdin.isatty():
+                    raise first_run.ConfigurationError(
+                        "--no-ui without a terminal needs --storage-dir "
+                        f"(for example --storage-dir \"{first_run.default_storage_dir()}\")"
+                    )
+                initial = first_run.prompt_plan(initial)
+            result = first_run.apply_setup(
+                initial,
+                config_path=config_path,
+                root=root,
+                force=args.force or (previous is not None and not args.storage_dir),
+            )
+    except UriboMcpError as exc:
+        _print({"ok": False, "error": str(exc)})
+        return 2
+    _print(result)
+    return 0 if result.get("ok") else 1
 
 
 def doctor(settings) -> dict:
+    from uribo_mcp.first_run import credentials_stored
     from uribo_mcp.live import google_token_summary
 
     browser_candidates = [
@@ -104,6 +198,17 @@ def doctor(settings) -> dict:
             "note": "Only PDF OCR needs Poppler; native PDF text still works.",
         },
         "google": google_token_summary(settings),
+        "config": {
+            "ok": settings.config_path is not None,
+            "required": False,
+            "path": settings.config_path,
+            "note": "Run `uribo-mcp setup` to choose where data is stored.",
+        },
+        "kobe_credentials": {
+            "ok": bool(credentials_stored()),
+            "required": False,
+            "note": "Stored by `uribo-mcp setup` or `uribo-mcp auth setup`; values are never shown.",
+        },
     }
     checks["ok"] = all(
         value.get("ok", True)
@@ -129,6 +234,8 @@ def main(argv: list[str] | None = None) -> int:
             config_path=args.config,
             root=args.root,
         )
+    if args.command == "setup":
+        return run_setup(args)
     settings = _settings(args)
     if args.command == "auth":
         if args.auth_command == "setup":
@@ -178,4 +285,4 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
-__all__ = ["doctor", "main"]
+__all__ = ["doctor", "main", "run_setup"]
