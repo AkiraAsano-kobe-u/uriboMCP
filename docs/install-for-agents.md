@@ -151,6 +151,24 @@ PowerShell で編集する場合は `ConvertTo-Json -Depth 10` を使い、BOM �
 （`[IO.File]::WriteAllText($path, $json, (New-Object Text.UTF8Encoding $false))`）。
 保存後、Claude Desktop の再起動をユーザーに頼む。
 
+## 6b. スキルを入れる
+
+登録したクライアントのスキルフォルダへ `skills\uribo-mcp` をフォルダごとコピーする。
+コピー先の親フォルダが無ければ作る。同名のフォルダが既にあれば上書きせず、ユーザーに尋ねる。
+
+| クライアント | コピー先 |
+| --- | --- |
+| Claude Code | `%USERPROFILE%\.claude\skills\uribo-mcp` |
+| Codex / ChatGPT デスクトップアプリ | `%USERPROFILE%\.agents\skills\uribo-mcp` |
+| Hermes Agent | `%LOCALAPPDATA%\hermes\skills\uribo-mcp` |
+
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude\skills" | Out-Null
+Copy-Item -Recurse .\skills\uribo-mcp "$env:USERPROFILE\.claude\skills\uribo-mcp"
+```
+
+Claude Desktop にはスキルフォルダが無いので、この手順は飛ばす。
+
 ## 7. 定期同期を登録する（ユーザーが希望した場合）
 
 ```powershell

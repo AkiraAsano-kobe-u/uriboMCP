@@ -159,3 +159,23 @@ def test_documentation_covers_all_three_clients_and_mcpb() -> None:
         "mcpb pack",
     ):
         assert required in documentation
+
+
+def test_agent_skill_is_loadable_and_names_only_real_tools() -> None:
+    import re
+
+    from uribo_mcp.config import load_settings  # noqa: F401 - import check only
+
+    text = (ROOT / "skills" / "uribo-mcp" / "SKILL.md").read_text(encoding="utf-8")
+    assert text.startswith("---\n")
+    front, body = text.split("---\n", 2)[1:]
+    meta = dict(line.split(": ", 1) for line in front.strip().splitlines())
+    assert meta["name"] == "uribo-mcp"
+    description = meta["description"].strip('"')
+    assert description.startswith("Use when ") and len(description) <= 60
+
+    server = (ROOT / "src" / "uribo_mcp" / "server.py").read_text(encoding="utf-8")
+    real_tools = set(re.findall(r"^    def ([a-z_]+)\(", server, flags=re.MULTILINE))
+    named = set(re.findall(r"`((?:get|list|search|read|build|mark|start|export|acknowledge)_[a-z_]+)", body))
+    assert named and named <= real_tools, sorted(named - real_tools)
+    assert "/Users/" not in text and "C:\\Users\\" not in text

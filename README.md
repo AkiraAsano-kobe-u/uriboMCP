@@ -108,6 +108,21 @@ codex mcp add uribo-mcp `
 
 Claude Desktop と MCPB バンドルの手順は [docs/client-setup.md](docs/client-setup.md) にあります。
 
+## AI 向けスキル
+
+`skills/uribo-mcp` は、AI に uribo-mcp の使い方（どのツールをどの順で使うか、検索のこつ、
+抽出テキストの限界、勝手に同期しないこと）を教えるスキルです。Claude Code・Codex（ChatGPT
+デスクトップアプリ）・Hermes Agent で同じフォルダを使えます。フォルダごとコピーします。
+
+```powershell
+# Claude Code
+Copy-Item -Recurse .\skills\uribo-mcp "$env:USERPROFILE\.claude\skills\uribo-mcp"
+# Codex / ChatGPT デスクトップアプリ
+Copy-Item -Recurse .\skills\uribo-mcp "$env:USERPROFILE\.agents\skills\uribo-mcp"
+# Hermes Agent（macOS / Linux では ~/.hermes/skills）
+Copy-Item -Recurse .\skills\uribo-mcp "$env:LOCALAPPDATA\hermes\skills\uribo-mcp"
+```
+
 ## 定期同期
 
 ```powershell
