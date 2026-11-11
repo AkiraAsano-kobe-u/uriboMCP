@@ -81,7 +81,7 @@ uv run uribo-mcp auth setup       # 大学アカウントをターミナルで�
 | `pdf_calendar` | 学年暦 | 有効 |
 | `newsnet` | 神戸大学ニュースネット | 有効 |
 | `venture` | BEEF+ Venture（特定の 1 コースのみ対応） | 無効 |
-| `moodle` | LMS BEEF（Moodle） | 無効 |
+| `moodle` | LMS BEEF（Moodle）の教材・課題・お知らせ | 有効 |
 | `mail` | 大学メール | 無効 |
 
 大学メールを同期するには、Google Cloud で自分用の Desktop OAuth クライアントを作り、
@@ -153,7 +153,7 @@ Windows タスクスケジューラに、全情報を毎日 7:00、BEEF+ を 8:0
 ## LMS BEEF（Moodle）の同期
 
 BEEF+ とは別の Moodle サイト `https://beef.center.kobe-u.ac.jp/<年度>/` の登録コースから、
-教材・課題・お知らせ・締切を取り込めます。セットアップで `moodle` を有効にします。
+教材・課題・お知らせ・締切を取り込めます。既定で有効です（不要ならセットアップで `moodle` を外します）。
 
 - 読み取り専用です。小テスト・アンケート・出席はページを開かず、名前と期限だけを記録します
 - 動画・音声ファイルは名前だけを記録し、ダウンロードしません

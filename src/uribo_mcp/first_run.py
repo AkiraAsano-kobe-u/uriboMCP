@@ -37,7 +37,7 @@ SOURCES: tuple[SourceOption, ...] = (
     SourceOption("pdf_calendar", "学年暦", "PDF"),
     SourceOption("newsnet", "神戸大学ニュースネット"),
     SourceOption("venture", "BEEF+ Venture", "特定の1コースのみ対応", default=False),
-    SourceOption("moodle", "LMS BEEF", "Moodle", default=False),
+    SourceOption("moodle", "LMS BEEF", "Moodle"),
     SourceOption("mail", "大学メール", "Google OAuth クライアントが必要", default=False),
 )
 SOURCE_IDS: tuple[str, ...] = tuple(option.id for option in SOURCES)

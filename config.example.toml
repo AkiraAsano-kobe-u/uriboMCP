@@ -8,9 +8,9 @@ credentials_dir = "credentials"
 
 [sync]
 # Available: beef, uribo, csi, pdf_calendar, newsnet, venture, moodle, mail.
-# "moodle" (LMS BEEF) needs its own KNOSSOS sign-in when cookies expire, "mail" needs
-# your own Google OAuth client, and "venture" only covers one fixed course.
-enabled_sources = ["beef", "uribo", "csi", "pdf_calendar", "newsnet"]
+# "moodle" is LMS BEEF, "mail" needs your own Google OAuth client, and "venture"
+# only covers one fixed course.
+enabled_sources = ["beef", "uribo", "csi", "pdf_calendar", "newsnet", "moodle"]
 request_interval_seconds = 3.0
 source_interval_seconds = 5.0
 job_stale_hours = 6

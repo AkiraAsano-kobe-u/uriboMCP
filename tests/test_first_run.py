@@ -54,7 +54,8 @@ def test_plan_places_everything_under_the_storage_folder(tmp_path: Path) -> None
     assert plan.export_root == tmp_path / "保存 先" / "exports"
     assert plan.credentials_dir == tmp_path / "保存 先" / "credentials"
     assert plan.sources == first_run.DEFAULT_SOURCES
-    assert "mail" not in plan.sources and "moodle" not in plan.sources
+    assert "moodle" in plan.sources
+    assert "mail" not in plan.sources and "venture" not in plan.sources
 
 
 def test_plan_accepts_individual_locations(tmp_path: Path) -> None:
