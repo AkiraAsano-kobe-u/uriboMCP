@@ -1,13 +1,16 @@
 [CmdletBinding()]
 param(
-    [string]$ProjectRoot = (Join-Path $PSScriptRoot ".."),
-    [string]$OutputPath = (Join-Path $PSScriptRoot "..\\packaging\\artifacts\\uribo-mcp.mcpb"),
+    [string]$ProjectRoot,
+    [string]$OutputPath,
     [string]$StagingRoot = (Join-Path $env:TEMP ("uribo-mcp-mcpb-" + [guid]::NewGuid().ToString("N")))
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# $PSScriptRoot is empty inside param() defaults on Windows PowerShell 5.1, so resolve here.
+if (-not $ProjectRoot) { $ProjectRoot = Join-Path $PSScriptRoot ".." }
+if (-not $OutputPath) { $OutputPath = Join-Path $PSScriptRoot "..\packaging\artifacts\uribo-mcp.mcpb" }
 $projectRootFull = [System.IO.Path]::GetFullPath($ProjectRoot)
 $outputPathFull = [System.IO.Path]::GetFullPath($OutputPath)
 $stagingRootFull = [System.IO.Path]::GetFullPath($StagingRoot)

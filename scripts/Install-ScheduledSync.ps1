@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$ProjectRoot = (Split-Path -Parent $PSScriptRoot),
+    [string]$ProjectRoot,
     [string]$ConfigPath,
     [string]$AllTaskName = "UriboMCP-AllSync",
     [string]$BeefTaskName = "UriboMCP-BeefSync"
@@ -14,6 +14,8 @@ function Quote-TaskArgument {
     return '"' + $Value.Replace('"', '\"') + '"'
 }
 
+# $PSScriptRoot is empty inside param() defaults on Windows PowerShell 5.1, so resolve here.
+if (-not $ProjectRoot) { $ProjectRoot = Split-Path -Parent $PSScriptRoot }
 $projectRootFull = [System.IO.Path]::GetFullPath($ProjectRoot)
 if (-not (Test-Path -LiteralPath $projectRootFull -PathType Container)) {
     throw "Project root does not exist: $projectRootFull"

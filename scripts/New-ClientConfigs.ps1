@@ -8,7 +8,7 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$ConfigPath,
 
-    [string]$OutputDirectory = (Join-Path $PSScriptRoot "..\\packaging\\generated"),
+    [string]$OutputDirectory,
 
     [string]$UvCommand = "uv",
 
@@ -36,6 +36,8 @@ function Write-GeneratedTextFile {
     [System.IO.File]::WriteAllText($Path, $Content, [System.Text.UTF8Encoding]::new($false))
 }
 
+# $PSScriptRoot is empty inside param() defaults on Windows PowerShell 5.1, so resolve here.
+if (-not $OutputDirectory) { $OutputDirectory = Join-Path $PSScriptRoot "..\packaging\generated" }
 $projectRootFull = Resolve-AbsolutePath -Path $ProjectRoot
 $configPathFull = Resolve-AbsolutePath -Path $ConfigPath
 $outputDirectoryFull = Resolve-AbsolutePath -Path $OutputDirectory

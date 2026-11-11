@@ -55,6 +55,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "doctor failed" }
           $store = Join-Path $env:RUNNER_TEMP "uribo データ"
           if (-not (Test-Path -LiteralPath (Join-Path $store "data\uribo.db"))) { throw "database was not created in the chosen folder" }
+      - name: Client config generator with default output folder
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\New-ClientConfigs.ps1 -ProjectRoot (Get-Location).Path -ConfigPath (Join-Path (Get-Location).Path "config.local.toml")
+          if ($LASTEXITCODE -ne 0) { throw "New-ClientConfigs.ps1 failed" }
+          if (-not (Test-Path -LiteralPath "packaging\generated\claude_desktop_config.json")) { throw "generated config is missing" }
       - name: Scheduled sync tasks
         run: |
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\Install-ScheduledSync.ps1
