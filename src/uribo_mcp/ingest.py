@@ -419,8 +419,11 @@ class CourseIngestor:
                     counts["details_skipped"] += 1
                     continue
                 detailed = self._with_detail(content, idnumber=idnumber)
-                counts["details_fetched"] += 1
-                self.pause()
+                # Rows without a URL (e.g. a PDF listed under an assignment
+                # heading) send no request, so they need no polite pause.
+                if category == "announcement" or content.get("url"):
+                    counts["details_fetched"] += 1
+                    self.pause()
                 if detailed is not content:
                     fingerprints[stable_id] = fingerprint
                 content = detailed

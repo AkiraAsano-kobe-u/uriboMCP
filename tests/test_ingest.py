@@ -248,3 +248,27 @@ def test_full_detail_pass_is_due_once_per_interval(tmp_path: Path) -> None:
             connection, sync_module.BEEF_FULL_DETAIL_KEY, old.isoformat()
         )
         assert sync_module._beef_full_detail_due(connection)
+
+
+class UrlLessAssignmentClient(FakeClient):
+    def fetch_course(self, idnumber: str) -> str:
+        return """
+<h1 class="course-title">解析学</h1>
+<article class="contents-item" data-module="report" data-content-id="9">
+  <span class="report-title">課題.pdf</span>
+</article>
+"""
+
+
+def test_rows_without_a_request_do_not_pause(tmp_path: Path) -> None:
+    settings = load_settings(root=tmp_path)
+    pauses = []
+    with database(settings.paths.db_path) as connection:
+        result = CourseIngestor(
+            settings=settings,
+            repository=Repository(connection),
+            client=UrlLessAssignmentClient(),
+            pause=lambda: pauses.append(1),
+        ).sync_course(idnumber="C1", skip_unchanged_details=True)
+    assert result["details_fetched"] == 0
+    assert pauses == []
