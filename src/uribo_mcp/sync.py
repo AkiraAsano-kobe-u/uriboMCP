@@ -490,9 +490,16 @@ def _set_preference(conn, key: str, value: str) -> None:
     conn.commit()
 
 
+MOODLE_FULL_DETAIL_KEY = "moodle_full_detail_at"
+
+
 def _beef_full_detail_due(conn) -> bool:
+    return _full_detail_due(conn, BEEF_FULL_DETAIL_KEY)
+
+
+def _full_detail_due(conn, key: str) -> bool:
     row = conn.execute(
-        "SELECT value FROM user_preferences WHERE key=?", (BEEF_FULL_DETAIL_KEY,)
+        "SELECT value FROM user_preferences WHERE key=?", (key,)
     ).fetchone()
     if not row:
         return True
@@ -815,12 +822,17 @@ def _sync_moodle(
 
     client = open_moodle(settings)
     with database(settings.paths.db_path) as conn:
-        return MoodleSynchronizer(
+        full = _full_detail_due(conn, MOODLE_FULL_DETAIL_KEY)
+        result = MoodleSynchronizer(
             settings=settings,
             repository=Repository(conn),
             client=client,
             pause=lambda: time.sleep(settings.sync.request_interval_seconds),
+            skip_unchanged_details=not full,
         ).run(course_ids=course_ids)
+        if full:
+            _set_preference(conn, MOODLE_FULL_DETAIL_KEY, utc_now())
+        return {**result, "full_detail_pass": full}
 
 
 def _classification_keywords(conn) -> list[str]:

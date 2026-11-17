@@ -21,6 +21,7 @@ course and keep its rows.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 from collections.abc import Callable
@@ -44,7 +45,7 @@ from uribo_mcp.moodle.parser import (
     parse_forum_discussion,
     parse_forum_discussions,
 )
-from uribo_mcp.repository import Repository
+from uribo_mcp.repository import Repository, canonical_json, content_hash
 
 LOGGER = logging.getLogger(__name__)
 SOURCE = "moodle"
@@ -54,6 +55,10 @@ MEDIA_SUFFIXES = frozenset(
 SNAPSHOT_CATEGORIES = ("material", "announcement", "assignment", "test", "survey", "attendance")
 METADATA_ONLY = frozenset({"test", "survey", "attendance"})
 MAX_DISCUSSIONS_PER_FORUM = 30
+# Modules whose extra request only re-reads static content. Assignments are
+# always reopened because their status and dates live on the detail page.
+SKIPPABLE_MODULES = frozenset({"resource", "page", "folder"})
+FINGERPRINT_KEY = "detail_fingerprints:moodle:{idnumber}"
 
 
 def attachment_key(owner: str, url: str) -> str:
@@ -101,6 +106,7 @@ class _Draft:
     metadata: dict[str, Any] = field(default_factory=dict)
     attachments: list[dict[str, Any]] = field(default_factory=list)
     complete: bool = True
+    reused: bool = False  # unchanged since the last detail read; keep the stored row
 
 
 class MoodleSynchronizer:
@@ -112,7 +118,11 @@ class MoodleSynchronizer:
         client: MoodleReadOnlyClient,
         pause: Callable[[], None] | None = None,
         today: date | None = None,
+        skip_unchanged_details: bool = False,
     ) -> None:
+        self.skip_unchanged_details = skip_unchanged_details
+        self._stored_fingerprints: dict[str, str] = {}
+        self._fingerprints: dict[str, str] = {}
         self.repository = repository
         self.client = client
         self.pause = pause or (lambda: None)
@@ -221,7 +231,11 @@ class MoodleSynchronizer:
         )
         course_id = linked["id"] if linked else anchor.id
         course_name = linked["course_name"] if linked else course["course_name"]
+        key = FINGERPRINT_KEY.format(idnumber=idnumber)
+        self._stored_fingerprints = self._load_fingerprints(key)
+        self._fingerprints = {}
         counts: dict[str, Any] = {
+            "details_skipped": 0,
             "course_id": course_id,
             "linked_to_beefplus": bool(linked),
             "items_created": 0,
@@ -247,6 +261,7 @@ class MoodleSynchronizer:
             for draft in drafts:
                 seen.append(draft.source_id)
                 self._store(draft, course_id=course_id, course_name=course_name, idnumber=idnumber, counts=counts)
+        self._save_fingerprints(key, self._fingerprints)
         # The course page itself loaded, and anything whose detail failed is in
         # ``seen``; scope the snapshot to this Moodle course's own rows only.
         counts["items_unavailable"] = self.repository.mark_items_missing(
@@ -258,6 +273,26 @@ class MoodleSynchronizer:
         return counts
 
     # --------------------------------------------------------------- internals
+    def _load_fingerprints(self, key: str) -> dict[str, str]:
+        row = self.repository.conn.execute(
+            "SELECT value FROM user_preferences WHERE key=?", (key,)
+        ).fetchone()
+        try:
+            value = json.loads(row[0]) if row else {}
+        except (TypeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def _save_fingerprints(self, key: str, fingerprints: dict[str, str]) -> None:
+        self.repository.conn.execute(
+            """INSERT INTO user_preferences(key,value,updated_at)
+               VALUES(?,?,datetime('now'))
+               ON CONFLICT(key) DO UPDATE SET
+                 value=excluded.value, updated_at=excluded.updated_at""",
+            (key, canonical_json(fingerprints)),
+        )
+        self.repository.conn.commit()
+
     def _retire_unenrolled(self, courses: list[dict[str, Any]]) -> list[int]:
         missing = self.repository.mark_courses_missing(
             source=SOURCE, seen_idnumbers=[course["idnumber"] for course in courses]
@@ -349,6 +384,17 @@ class MoodleSynchronizer:
             draft.metadata["read_policy"] = "metadata_only"
             draft.deadline = calendar.get("deadline") or self._fallback_deadline(draft.source_id)
             return draft
+        fingerprint = content_hash(
+            {"activity": activity, "calendar": calendar, "category": category}
+        )
+        if module in SKIPPABLE_MODULES:
+            if (
+                self.skip_unchanged_details
+                and self._stored_fingerprints.get(draft.source_id) == fingerprint
+            ):
+                draft.reused = True
+                self._fingerprints[draft.source_id] = fingerprint
+                return draft
         detail: dict[str, Any] = {}
         try:
             if module == "resource":
@@ -367,6 +413,8 @@ class MoodleSynchronizer:
             LOGGER.warning("Moodle detail fetch failed for cm %s: %s", cmid, exc)
             draft.complete = False
             return draft
+        if module in SKIPPABLE_MODULES:
+            self._fingerprints[draft.source_id] = fingerprint
         draft.body = detail.get("body") or draft.body
         draft.attachments.extend(
             _file_attachment(cmid, link["url"], link["name"]) for link in detail.get("files") or []
@@ -452,6 +500,15 @@ class MoodleSynchronizer:
         idnumber: str,
         counts: dict[str, Any],
     ) -> None:
+        if draft.reused:
+            exists = self.repository.conn.execute(
+                "SELECT 1 FROM items WHERE source=? AND source_id=? AND available=1",
+                (SOURCE, draft.source_id),
+            ).fetchone()
+            if exists:
+                counts["details_skipped"] += 1
+                return  # unchanged on the course page: keep body and attachments
+            draft.reused = False  # row vanished meanwhile; store what we have
         if not draft.complete:
             exists = self.repository.conn.execute(
                 "SELECT 1 FROM items WHERE source=? AND source_id=?", (SOURCE, draft.source_id)

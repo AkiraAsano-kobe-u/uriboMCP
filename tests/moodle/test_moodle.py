@@ -1244,3 +1244,45 @@ def test_submit_form_rejects_unexpected_final_host() -> None:
     with pytest.raises(AuthenticationRequired):
         live._submit_knossos_form(driver, "beefplus.center.kobe-u.ac.jp", KobeCredentials("u", "p"))
     assert driver.clicks == 1
+
+
+class _CountingMoodleClient(FakeMoodleClient):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.resolved: list[str] = []
+
+    def resolve_resource_file(self, cmid):
+        self.resolved.append(str(cmid))
+        return super().resolve_resource_file(cmid)
+
+
+def test_unchanged_resources_are_not_resolved_again(tmp_path: Path) -> None:
+    settings = load_settings(root=tmp_path)
+    _beef(settings)
+    client = _CountingMoodleClient()
+
+    def run(skip: bool):
+        with database(settings.paths.db_path) as conn:
+            return MoodleSynchronizer(
+                settings=settings,
+                repository=Repository(conn),
+                client=client,
+                today=date(2026, 10, 5),
+                skip_unchanged_details=skip,
+            ).run()
+
+    run(True)
+    first = len(client.resolved)
+    assert first > 0
+    fetched = len(client.fetched)
+    result = run(True)
+    assert len(client.resolved) == first  # nothing resolved again
+    assert len(client.fetched) > fetched  # assignments/forums are still read
+    assert sum(c["details_skipped"] for c in result["courses"].values()) >= first
+    with database(settings.paths.db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM attachments a JOIN items i ON i.id=a.item_id "
+            "WHERE i.source='moodle' AND a.available=1"
+        ).fetchone()[0] > 0
+    run(False)  # the daily full pass resolves everything again
+    assert len(client.resolved) == 2 * first
