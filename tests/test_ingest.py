@@ -177,3 +177,55 @@ def test_task_list_deadline_fills_course_content_without_one(tmp_path: Path) -> 
             "SELECT deadline FROM items WHERE source_id='test/C1/5'"
         ).fetchone()
         assert row["deadline"] == "2026-12-18T23:59:00"
+
+
+class AssignmentClient(FakeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.end = "2026/11/24 10:40"
+        self.status = "未提出"
+
+    def fetch_course(self, idnumber: str) -> str:
+        return f"""
+<h1 class="course-title">解析学</h1>
+<div class="course-result-list contents-display-flex sortReportBlock clearfix">
+  <a class="course-view-report-name reportTitle" href="/lms/course/report/submission?idnumber=C1&amp;reportId=7">自習シート</a>
+  <div class="course-view-report-time-start timeStart">2026/11/17 11:40</div>
+  <div class="course-view-report-time-end timeEnd">{self.end}</div>
+  <div class="course-view-report-status submitStatus"><label>{self.status}</label></div>
+</div>
+"""
+
+    def fetch_assignment_detail(self, url: str) -> str:
+        self.detail_calls += 1
+        return "<div id='contents'><h2 class='contents-title'>自習シート</h2><div class='body'>問題1</div></div>"
+
+
+def test_unchanged_course_rows_do_not_reopen_detail_pages(tmp_path: Path) -> None:
+    settings = load_settings(root=tmp_path)
+    client = AssignmentClient()
+    with database(settings.paths.db_path) as connection:
+        ingestor = CourseIngestor(
+            settings=settings,
+            repository=Repository(connection),
+            client=client,
+            pause=lambda: None,
+        )
+        first = ingestor.sync_course(idnumber="C1", skip_unchanged_details=True)
+        assert (first["details_fetched"], client.detail_calls) == (1, 1)
+
+        second = ingestor.sync_course(idnumber="C1", skip_unchanged_details=True)
+        assert (second["details_skipped"], client.detail_calls) == (1, 1)
+        row = connection.execute(
+            "SELECT body,deadline,available FROM items WHERE source_id='assignment/C1/7'"
+        ).fetchone()
+        assert row["body"] == "問題1"
+        assert row["deadline"] == "2026-11-24T10:40"
+        assert row["available"] == 1
+
+        client.status = "期限内提出"
+        third = ingestor.sync_course(idnumber="C1", skip_unchanged_details=True)
+        assert (third["details_fetched"], client.detail_calls) == (1, 2)
+
+        full = ingestor.sync_course(idnumber="C1", skip_unchanged_details=False)
+        assert (full["details_fetched"], client.detail_calls) == (1, 3)

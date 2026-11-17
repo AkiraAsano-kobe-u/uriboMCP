@@ -463,6 +463,36 @@ def _sync_mail(settings: Settings) -> dict[str, Any]:
     return result
 
 
+BEEF_FULL_DETAIL_KEY = "beef_full_detail_at"
+BEEF_FULL_DETAIL_HOURS = 20
+
+
+def _set_preference(conn, key: str, value: str) -> None:
+    conn.execute(
+        """INSERT INTO user_preferences(key,value,updated_at)
+           VALUES(?,?,datetime('now'))
+           ON CONFLICT(key) DO UPDATE SET
+             value=excluded.value, updated_at=excluded.updated_at""",
+        (key, value),
+    )
+    conn.commit()
+
+
+def _beef_full_detail_due(conn) -> bool:
+    row = conn.execute(
+        "SELECT value FROM user_preferences WHERE key=?", (BEEF_FULL_DETAIL_KEY,)
+    ).fetchone()
+    if not row:
+        return True
+    try:
+        last = datetime.fromisoformat(str(row[0]).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=UTC)
+    return datetime.now(UTC) - last >= timedelta(hours=BEEF_FULL_DETAIL_HOURS)
+
+
 def _sync_beef(
     settings: Settings, *, course_ids: list[str] | None = None
 ) -> dict[str, Any]:
@@ -665,12 +695,19 @@ def _sync_beef(
                 for task in tasks
                 if task.get("deadline")
             }
+            # Detail pages are reopened only for rows whose course-page summary
+            # changed, except for one full pass a day that catches edits only
+            # visible on the detail page.
+            full_details = _beef_full_detail_due(conn)
             for idnumber in selected:
                 course_results[idnumber] = ingestor.sync_course(
                     idnumber=idnumber,
                     known_name=names.get(idnumber),
                     known_deadlines=task_deadlines,
+                    skip_unchanged_details=not full_details,
                 )
+            if full_details:
+                _set_preference(conn, BEEF_FULL_DETAIL_KEY, utc_now())
             legacy_counts.pop("seen_source_ids", None)
             return {
                 **legacy_counts,

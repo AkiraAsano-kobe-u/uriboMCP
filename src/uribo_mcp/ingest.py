@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Callable, Iterable
@@ -19,10 +20,40 @@ from uribo_mcp.course.parser import (
 from uribo_mcp.documents.extractor import DocumentLimits, extract_document
 from uribo_mcp.documents.ocr import TesseractCliBackend
 from uribo_mcp.models import AttachmentRecord, CourseRecord, ItemRecord
-from uribo_mcp.repository import Repository
+from uribo_mcp.repository import Repository, canonical_json, content_hash
 
 LOGGER = logging.getLogger(__name__)
 DETAIL_CATEGORIES = {"announcement", "assignment"}
+# Course-page fields that change whenever a detail page would show something new
+# (status, period, attachments). Rows whose fingerprint is unchanged keep the
+# detail data already stored and are not reopened.
+_FINGERPRINT_FIELDS = (
+    "category",
+    "title",
+    "url",
+    "body",
+    "published_at",
+    "deadline",
+    "available_from",
+    "available_until",
+    "submission_status",
+    "group_title",
+)
+_FINGERPRINT_KEY = "detail_fingerprints:{source}:{idnumber}"
+
+
+def summary_fingerprint(content: dict[str, Any], extra: Any = None) -> str:
+    """Hash of what a course-page row shows about an item (no detail data)."""
+    return content_hash(
+        {
+            **{name: content.get(name) for name in _FINGERPRINT_FIELDS},
+            "attachments": sorted(
+                str(attachment.get("stable_id"))
+                for attachment in content.get("attachments") or []
+            ),
+            "extra": extra,
+        }
+    )
 METADATA_ONLY_CATEGORIES = {"test", "survey", "attendance"}
 AttachmentSyncOutcome = Literal["downloaded", "reused", "failed"]
 
@@ -327,11 +358,16 @@ class CourseIngestor:
         known_name: str | None = None,
         source: str = "beef",
         known_deadlines: dict[str, str] | None = None,
+        skip_unchanged_details: bool = False,
     ) -> dict[str, Any]:
         """Sync one course page.
 
         ``known_deadlines`` maps ``stable_id`` to a deadline taken from another
         page (BEEF+'s task list); it fills content whose own deadline is empty.
+
+        With ``skip_unchanged_details`` an assignment/announcement whose
+        course-page row is unchanged since its detail page was last read is
+        left as stored instead of reopening the detail page.
         """
         html = self.client.fetch_course(idnumber)
         page = parse_course_page(html, idnumber=idnumber, base_url=self.client.base_url)
@@ -359,13 +395,35 @@ class CourseIngestor:
             "attachments_reused": 0,
             "attachments_failed": 0,
         }
+        counts["details_fetched"] = 0
+        counts["details_skipped"] = 0
         seen: list[str] = []
+        fingerprint_key = _FINGERPRINT_KEY.format(source=source, idnumber=idnumber)
+        stored_fingerprints = self._load_fingerprints(fingerprint_key)
+        fingerprints: dict[str, str] = {}
         for content in page["contents"]:
             category = str(content["category"])
+            stable_id = str(content["stable_id"])
             # Safety invariant: metadata-only activities are never opened.
             if category in DETAIL_CATEGORIES:
-                content = self._with_detail(content, idnumber=idnumber)
+                fingerprint = summary_fingerprint(
+                    content, (known_deadlines or {}).get(stable_id)
+                )
+                if (
+                    skip_unchanged_details
+                    and stored_fingerprints.get(stable_id) == fingerprint
+                    and self._is_available(source, stable_id)
+                ):
+                    fingerprints[stable_id] = fingerprint
+                    seen.append(stable_id)
+                    counts["details_skipped"] += 1
+                    continue
+                detailed = self._with_detail(content, idnumber=idnumber)
+                counts["details_fetched"] += 1
                 self.pause()
+                if detailed is not content:
+                    fingerprints[stable_id] = fingerprint
+                content = detailed
             elif category in METADATA_ONLY_CATEGORIES:
                 content = {
                     **content,
@@ -428,6 +486,7 @@ class CourseIngestor:
                 counts["attachments_downloaded"] += attachment_counts["downloaded"]
                 counts["attachments_reused"] += attachment_counts["reused"]
                 counts["attachments_failed"] += attachment_counts["failed"]
+        self._save_fingerprints(fingerprint_key, fingerprints)
         counts["items_unavailable"] = self.repository.mark_items_missing(
             source=source,
             seen_source_ids=seen,
@@ -457,6 +516,33 @@ class CourseIngestor:
             idnumber=idnumber,
             attachments=attachments,
         )
+
+    def _load_fingerprints(self, key: str) -> dict[str, str]:
+        row = self.repository.conn.execute(
+            "SELECT value FROM user_preferences WHERE key=?", (key,)
+        ).fetchone()
+        try:
+            value = json.loads(row[0]) if row else {}
+        except (TypeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def _save_fingerprints(self, key: str, fingerprints: dict[str, str]) -> None:
+        self.repository.conn.execute(
+            """INSERT INTO user_preferences(key,value,updated_at)
+               VALUES(?,?,datetime('now'))
+               ON CONFLICT(key) DO UPDATE SET
+                 value=excluded.value, updated_at=excluded.updated_at""",
+            (key, canonical_json(fingerprints)),
+        )
+        self.repository.conn.commit()
+
+    def _is_available(self, source: str, stable_id: str) -> bool:
+        row = self.repository.conn.execute(
+            "SELECT available FROM items WHERE source=? AND source_id=?",
+            (source, stable_id),
+        ).fetchone()
+        return bool(row and row[0])
 
     def _with_detail(self, content: dict[str, Any], *, idnumber: str) -> dict[str, Any]:
         url = str(content.get("url") or "")
