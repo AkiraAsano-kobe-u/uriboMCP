@@ -509,7 +509,8 @@ def test_activity_page_reads_deadline_only_from_dates_and_status_table() -> None
     )
     detail = parse_activity_page(html, base_url=BASE)
     assert detail["deadline"] == "2026-10-19T23:59"
-    assert detail["submission_status"] == "未提出"
+    assert detail["submission_status"] == "not_submitted"
+    assert detail["submission_status_text"] == "未提出"
     assert detail["files"][0]["url"].endswith("template.docx")
 
 
@@ -563,7 +564,7 @@ def test_sync_stores_items_files_and_links_beefplus_course(tmp_path: Path) -> No
     assignment = rows["assignment/2026_3X004/104"]
     assert assignment["deadline"] == "2026-10-19T23:59"
     assert "レポートを提出" in assignment["body"]
-    assert json.loads(assignment["metadata_json"])["submission_status"] == "未提出"
+    assert json.loads(assignment["metadata_json"])["submission_status"] == "not_submitted"
     assert rows["announcement/2026_3X004/d55"]["body"] == "10月12日は休講です。"
     assert rows["announcement/2026_3X004/d55"]["published_at"] == "2026-10-06T09:00"
     with database(settings.paths.db_path) as conn:
@@ -594,7 +595,7 @@ def test_sync_never_changes_is_done(tmp_path: Path) -> None:
         ASSIGN_HTML = original
     row = _rows(settings)["assignment/2026_3X004/104"]
     assert row["is_done"] == 0
-    assert json.loads(row["metadata_json"])["submission_status"] == "提出済み"
+    assert json.loads(row["metadata_json"])["submission_status"] == "submitted"
 
 
 def test_resync_reuses_cache_and_redownloads_new_revision(tmp_path: Path) -> None:
@@ -1286,3 +1287,22 @@ def test_unchanged_resources_are_not_resolved_again(tmp_path: Path) -> None:
         ).fetchone()[0] > 0
     run(False)  # the daily full pass resolves everything again
     assert len(client.resolved) == 2 * first
+
+
+def test_moodle4_submission_status_table_inside_wrapper_div() -> None:
+    from uribo_mcp.moodle.parser import parse_activity_page
+
+    html = """
+    <div id="region-main"><div role="main">
+      <div class="submissionstatustable"><h3>提出ステータス</h3>
+        <div class="box py-3 boxaligncenter submissionsummarytable"><div class="table-responsive">
+        <table class="generaltable table-bordered"><tbody>
+          <tr><th class="cell c0" scope="row">提出ステータス</th>
+              <td class="submissionstatussubmitted cell c1 lastcol">評定のために提出済み</td></tr>
+          <tr><th class="cell c0" scope="row">評定ステータス</th><td>評定なし</td></tr>
+        </tbody></table></div></div>
+      </div>
+    </div></div>"""
+    detail = parse_activity_page(html, base_url=BASE)
+    assert detail["submission_status"] == "submitted"
+    assert detail["submission_status_text"] == "評定のために提出済み"

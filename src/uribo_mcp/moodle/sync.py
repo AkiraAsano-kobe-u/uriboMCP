@@ -426,7 +426,7 @@ class MoodleSynchronizer:
             or detail.get("deadline")
             or self._fallback_deadline(draft.source_id)
         )
-        for key in ("submission_status", "dates"):
+        for key in ("submission_status", "submission_status_text", "dates"):
             if detail.get(key):
                 draft.metadata[key] = detail[key]
         return draft

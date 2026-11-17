@@ -212,6 +212,20 @@ def parse_course_page(html: str, *, base_url: str) -> dict[str, Any]:
     }
 
 
+def normalize_submission_status(text: str | None) -> str | None:
+    """Map Moodle's 提出ステータス text to submitted / not_submitted / draft."""
+    if not text:
+        return None
+    lowered = text.casefold()
+    if "下書き" in text or "draft" in lowered:
+        return "draft"
+    if any(word in text for word in ("未提出", "提出なし")) or "no attempt" in lowered or "no submission" in lowered:
+        return "not_submitted"
+    if "提出済" in text or "submitted" in lowered:
+        return "submitted"
+    return None
+
+
 def parse_activity_page(html: str, *, base_url: str) -> dict[str, Any]:
     """Body text, dates, submission status and files from a page/folder/assign view."""
     soup = BeautifulSoup(html or "", "html.parser")
@@ -227,10 +241,14 @@ def parse_activity_page(html: str, *, base_url: str) -> dict[str, Any]:
         if match:
             dates[match.group(1).strip()] = match.group(2).strip()
     status: dict[str, str] = {}
-    for tr in main.select("table.submissionstatustable tr"):
+    # Moodle 4 puts the class on a wrapping <div>; older themes on the <table>.
+    for tr in main.select(".submissionstatustable tr"):
         th, td = tr.select_one("th"), tr.select_one("td")
         if th and td:
             status[_text(th)] = _text(td)
+    status_text = next(
+        (value for key, value in status.items() if _STATUS_LABEL.search(key)), None
+    )
     deadline = next(
         (
             parsed
@@ -244,9 +262,8 @@ def parse_activity_page(html: str, *, base_url: str) -> dict[str, Any]:
     return {
         "body": "\n\n".join(dict.fromkeys(body_parts)) or None,
         "deadline": deadline,
-        "submission_status": next(
-            (value for key, value in status.items() if _STATUS_LABEL.search(key)), None
-        ),
+        "submission_status": normalize_submission_status(status_text),
+        "submission_status_text": status_text,
         "dates": dates or None,
         "files": pluginfile_links(main, base_url=base_url),
     }
