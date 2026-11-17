@@ -19,9 +19,9 @@ from filelock import FileLock, Timeout
 from uribo_mcp.config import ENV_CONFIG, Settings, load_settings
 from uribo_mcp.db import database
 from uribo_mcp.errors import AuthenticationRequired
-from uribo_mcp.ingest import CourseIngestor, ingest_items
+from uribo_mcp.ingest import CourseIngestor, ingest_items, summary_fingerprint
 from uribo_mcp.legacy import classifier, dedup, inference
-from uribo_mcp.repository import Repository, utc_now
+from uribo_mcp.repository import Repository, canonical_json, utc_now
 from uribo_mcp.subprocesses import hidden_process_kwargs
 
 LOGGER = logging.getLogger(__name__)
@@ -465,6 +465,18 @@ def _sync_mail(settings: Settings) -> dict[str, Any]:
 
 BEEF_FULL_DETAIL_KEY = "beef_full_detail_at"
 BEEF_FULL_DETAIL_HOURS = 20
+BEEF_GLOBAL_FINGERPRINT_KEY = "detail_fingerprints:beef:_global"
+
+
+def _load_json_preference(conn, key: str) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT value FROM user_preferences WHERE key=?", (key,)
+    ).fetchone()
+    try:
+        value = json.loads(row[0]) if row else {}
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def _set_preference(conn, key: str, value: str) -> None:
@@ -537,6 +549,22 @@ def _sync_beef(
             or {str(row["idnumber"]) for row in timetable if row.get("idnumber")}
         )
         selected_courses = set(selected)
+        # Detail pages are reopened only for rows whose list/course-page summary
+        # changed, except for one full pass a day that catches edits only
+        # visible on the detail page.
+        with database(settings.paths.db_path) as conn:
+            full_details = _beef_full_detail_due(conn)
+            global_fingerprints = _load_json_preference(conn, BEEF_GLOBAL_FINGERPRINT_KEY)
+            stored_rows = {
+                str(row["source_id"]): dict(row)
+                for row in conn.execute(
+                    """SELECT source_id, body, deadline, published_at, metadata_json, available
+                       FROM items WHERE source='beef'
+                         AND category IN ('assignment','announcement')"""
+                )
+            }
+        new_global_fingerprints: dict[str, str] = {}
+        global_details_skipped = 0
         enriched_items = []
         for item in items:
             enriched = dict(item)
@@ -546,6 +574,24 @@ def _sync_beef(
             # and announcements. Processing the global-list copy as well causes the
             # same item and attachments to oscillate between two representations.
             if item_course in selected_courses:
+                continue
+            source_id = str(item["source_id"])
+            fingerprint = summary_fingerprint(item)
+            stored = stored_rows.get(source_id)
+            if (
+                not full_details
+                and global_fingerprints.get(source_id) == fingerprint
+                and stored
+                and stored["available"]
+            ):
+                # Unchanged since the detail page was last read: keep stored data.
+                enriched["body"] = stored["body"]
+                enriched["deadline"] = stored["deadline"]
+                enriched["published_at"] = stored["published_at"]
+                enriched["metadata"] = json.loads(stored["metadata_json"] or "{}")
+                new_global_fingerprints[source_id] = fingerprint
+                global_details_skipped += 1
+                enriched_items.append(enriched)
                 continue
             try:
                 if item["category"] == "assignment" and item.get("url"):
@@ -567,6 +613,7 @@ def _sync_beef(
                         "available_until": detail.get("available_until"),
                     }
                     attachments = list(detail.get("attachments") or [])
+                    new_global_fingerprints[source_id] = fingerprint
                     time.sleep(settings.sync.request_interval_seconds)
                 elif item["category"] == "announcement":
                     information_id = item["source_id"].rsplit("/", 1)[-1]
@@ -588,6 +635,7 @@ def _sync_beef(
                         )
                         enriched["metadata"] = {"idnumber": idnumber}
                         attachments = list(detail.get("attachments") or [])
+                        new_global_fingerprints[source_id] = fingerprint
                         time.sleep(settings.sync.request_interval_seconds)
             except Exception as exc:
                 LOGGER.warning(
@@ -695,10 +743,11 @@ def _sync_beef(
                 for task in tasks
                 if task.get("deadline")
             }
-            # Detail pages are reopened only for rows whose course-page summary
-            # changed, except for one full pass a day that catches edits only
-            # visible on the detail page.
-            full_details = _beef_full_detail_due(conn)
+            _set_preference(
+                conn,
+                BEEF_GLOBAL_FINGERPRINT_KEY,
+                canonical_json(new_global_fingerprints),
+            )
             for idnumber in selected:
                 course_results[idnumber] = ingestor.sync_course(
                     idnumber=idnumber,
@@ -713,6 +762,8 @@ def _sync_beef(
                 **legacy_counts,
                 "timetable_rows": len(timetable),
                 "courses_unavailable": len(missing_course_ids),
+                "full_detail_pass": full_details,
+                "global_details_skipped": global_details_skipped,
                 "detail_attachments": detail_attachment_counts,
                 "courses": course_results,
             }

@@ -229,3 +229,22 @@ def test_unchanged_course_rows_do_not_reopen_detail_pages(tmp_path: Path) -> Non
 
         full = ingestor.sync_course(idnumber="C1", skip_unchanged_details=False)
         assert (full["details_fetched"], client.detail_calls) == (1, 3)
+
+
+def test_full_detail_pass_is_due_once_per_interval(tmp_path: Path) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from uribo_mcp import sync as sync_module
+
+    settings = load_settings(root=tmp_path)
+    with database(settings.paths.db_path) as connection:
+        assert sync_module._beef_full_detail_due(connection)
+        sync_module._set_preference(
+            connection, sync_module.BEEF_FULL_DETAIL_KEY, datetime.now(UTC).isoformat()
+        )
+        assert not sync_module._beef_full_detail_due(connection)
+        old = datetime.now(UTC) - timedelta(hours=sync_module.BEEF_FULL_DETAIL_HOURS + 1)
+        sync_module._set_preference(
+            connection, sync_module.BEEF_FULL_DETAIL_KEY, old.isoformat()
+        )
+        assert sync_module._beef_full_detail_due(connection)
