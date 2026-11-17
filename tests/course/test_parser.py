@@ -101,3 +101,56 @@ def test_assignment_detail_parses_report_download_recipe():
     assert attachment["content_id"] == "66853"
     assert attachment["metadata"]["download_kind"] == "report_submission"
     assert attachment["metadata"]["report_id"] == "66853"
+
+
+CURRENT_REPORT_ROWS = """
+<h1 id="courseName">データ解析</h1>
+<div class="contents-list contents-display-flex contents-tag sp-contents-hidden contents-header-txt">
+  <div id="timeStart" class="course-view-report-time-start sortable down"><span class="bold-txt">提出開始日</span></div>
+  <div id="timeEnd" class="course-view-report-time-end sortable down"><span class="bold-txt">提出終了日</span></div>
+</div>
+<div class="contents-list sortReportParent">
+  <div class="course-result-list contents-display-flex sortReportBlock clearfix">
+    <a class="course-view-report-name bold-txt link-txt reportTitle" href="/lms/course/report/submission?idnumber=20263X0032001&amp;reportId=72373">第五回課題</a>
+    <div class="course-view-report-time-start timeStart sp-contents-hidden">2026/11/17 10:00</div>
+    <div class="course-view-report-time-end timeEnd sp-contents-hidden">2026/11/17 23:59</div>
+    <div class="course-view-report-time pc-contents-hidden">2026/11/17 10:00 ～ 2026/11/17 23:59</div>
+    <div class="course-view-report-status submitStatus"><label>期限内提出</label></div>
+    <input type="hidden" class="reportId" value="72373">
+  </div>
+  <div class="course-result-list contents-display-flex sortReportBlock clearfix">
+    <a class="course-view-report-name bold-txt link-txt reportTitle" href="/lms/course/report/submission?idnumber=20263X0032001&amp;reportId=72400">第六回課題</a>
+    <div class="course-view-report-time pc-contents-hidden">2026/11/24 10:00 ～ 2026/11/24 23:59</div>
+    <div class="course-view-report-status submitStatus"><label>未提出</label></div>
+  </div>
+</div>
+"""
+
+
+def test_current_beef_report_rows_take_deadline_from_unlabelled_period_cells():
+    page = parse_course_page(CURRENT_REPORT_ROWS, idnumber="20263X0032001")
+    rows = {item["stable_id"]: item for item in page["contents"]}
+    fifth = rows["assignment/20263X0032001/72373"]
+    assert fifth["deadline"] == "2026-11-17T23:59"
+    assert fifth["available_from"] == "2026-11-17T10:00"
+    assert fifth["submission_status"] == "submitted"
+    sixth = rows["assignment/20263X0032001/72400"]
+    assert sixth["deadline"] == "2026-11-24T23:59"
+    assert sixth["submission_status"] == "not_submitted"
+
+
+def test_current_assignment_detail_reads_submission_period_header():
+    html = """
+    <div id="contents"><h2 class="contents-title">第6回自習シート</h2>
+      <div class="contents-detail contents-vertical">
+        <div class="contents-header contents-header-txt"><span class="bold-txt">提出期間</span></div>
+        <div class="contents-input-area"><span>2026/11/17 11:40</span><span>～</span><span>2026/11/24 10:40</span></div>
+      </div>
+      <div class="contents-detail contents-vertical">
+        <div class="contents-header contents-header-txt"><span class="bold-txt">期間外提出</span></div>
+        <div class="contents-input-area"><div>不可</div></div>
+      </div>
+    </div>"""
+    detail = parse_assignment_detail(html, idnumber="20263X0542001", report_id="72231")
+    assert detail["deadline"] == "2026-11-24T10:40"
+    assert detail["available_from"] == "2026-11-17T11:40"

@@ -658,9 +658,18 @@ def _sync_beef(
                 for row in timetable
                 if row.get("idnumber")
             }
+            # The task list (/lms/task) carries deadlines for open assignments
+            # and tests; use them when a course page row has none.
+            task_deadlines = {
+                str(task["source_id"]): str(task["deadline"])
+                for task in tasks
+                if task.get("deadline")
+            }
             for idnumber in selected:
                 course_results[idnumber] = ingestor.sync_course(
-                    idnumber=idnumber, known_name=names.get(idnumber)
+                    idnumber=idnumber,
+                    known_name=names.get(idnumber),
+                    known_deadlines=task_deadlines,
                 )
             legacy_counts.pop("seen_source_ids", None)
             return {

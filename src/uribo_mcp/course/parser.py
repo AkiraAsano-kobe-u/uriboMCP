@@ -274,10 +274,43 @@ def _date_fields(text: str) -> tuple[str | None, str | None, str | None]:
     return published, deadline, until
 
 
+_PERIOD = re.compile(
+    r"(20\d{2}/\d{1,2}/\d{1,2}(?:\s+\d{1,2}:\d{2})?)(?::\d{2})?\s*[～〜~]\s*"
+    r"(20\d{2}/\d{1,2}/\d{1,2}(?:\s+\d{1,2}:\d{2})?)"
+)
+_PERIOD_CATEGORIES = frozenset({"assignment", "test", "survey"})
+_PERIOD_LABELS = ("提出期間", "受験期間", "回答期間", "実施期間", "公開期間")
+
+
+def _period(element: Tag) -> tuple[str | None, str | None]:
+    """Return (start, end) of a BEEF+ submission/answer period.
+
+    Course pages put the dates in unlabelled ``timeStart``/``timeEnd`` cells
+    (the labels live in a separate header row); detail pages show
+    ``提出期間`` as a header followed by ``start ～ end`` spans.
+    """
+    start_el = element.select_one(".timeStart, [class*='time-start']:not(.sortable)")
+    end_el = element.select_one(".timeEnd, [class*='time-end']:not(.sortable)")
+    start, end = _iso(_text(start_el)), _iso(_text(end_el))
+    if end:
+        return start, end
+    for header in element.select(".contents-header, .contents-header-txt"):
+        if not any(label in _text(header) for label in _PERIOD_LABELS):
+            continue
+        area = header.find_next_sibling()
+        match = _PERIOD.search(_text(area)) if area else None
+        if match:
+            return _iso(match.group(1)), _iso(match.group(2))
+    match = _PERIOD.search(_text(element))
+    if match:
+        return _iso(match.group(1)), _iso(match.group(2))
+    return None, None
+
+
 def _status(text: str) -> str | None:
     if any(word in text for word in ("未提出", "未回答", "未受験")):
         return "not_submitted"
-    if any(word in text for word in ("提出済", "回答済", "受験済", "完了")):
+    if any(word in text for word in ("提出済", "回答済", "受験済", "完了", "期限内提出", "期限後提出", "期間外提出済")):
         return "submitted"
     if "下書き" in text:
         return "draft"
@@ -344,6 +377,10 @@ def parse_course_page(html: str, *, idnumber: str | None = None, base_url: str =
         seen.add(stable_id)
         raw_text = _text(element)
         published, deadline, until = _date_fields(raw_text)
+        available_from = None
+        if category in _PERIOD_CATEGORIES:
+            available_from, period_end = _period(element)
+            deadline = deadline or period_end
         group = element.find_parent(class_=re.compile(r"group|section|topic", re.I))
         group_title = _text(group.select_one("h1,h2,h3,h4,.title,.group-title")) if group else None
         attachments = _attachments(element, base_url, page_id)
@@ -372,7 +409,7 @@ def parse_course_page(html: str, *, idnumber: str | None = None, base_url: str =
         contents.append(CourseContent(
             stable_id=stable_id, category=category, title=content_title, url=href,
             body=_text(body_el) or None, published_at=published, deadline=deadline,
-            available_until=until, submission_status=_status(raw_text), group_title=group_title or None,
+            available_from=available_from, available_until=until, submission_status=_status(raw_text), group_title=group_title or None,
             attachments=attachments, metadata=metadata,
         ))
     return CoursePage(str(page_id), title, overview, tuple(contents)).to_dict()
@@ -387,11 +424,16 @@ def _parse_detail(html: str, *, category: str, idnumber: str | None, content_id:
     resolved_course = idnumber or inferred_id or "unknown"
     resolved_content = content_id or url_id or "derived-" + _stable(category, resolved_course, title, text)
     published, deadline, until = _date_fields(text)
+    available_from = None
+    if category in _PERIOD_CATEGORIES:
+        available_from, period_end = _period(root)
+        deadline = deadline or period_end
     body_el = root.select_one(".body, .description, .detail-body, .contents-detail")
     content = CourseContent(
         stable_id=f"{category}/{resolved_course}/{resolved_content}", category=category,
         title=title, url=None, body=_text(body_el) or text or None, published_at=published,
-        deadline=deadline, available_until=until, submission_status=_status(text),
+        deadline=deadline, available_from=available_from, available_until=until,
+        submission_status=_status(text),
         attachments=_attachments(root, base_url, resolved_course),
     )
     return content.to_dict()

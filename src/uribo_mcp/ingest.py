@@ -326,7 +326,13 @@ class CourseIngestor:
         idnumber: str,
         known_name: str | None = None,
         source: str = "beef",
+        known_deadlines: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        """Sync one course page.
+
+        ``known_deadlines`` maps ``stable_id`` to a deadline taken from another
+        page (BEEF+'s task list); it fills content whose own deadline is empty.
+        """
         html = self.client.fetch_course(idnumber)
         page = parse_course_page(html, idnumber=idnumber, base_url=self.client.base_url)
         parsed_name = str(page.get("title") or "").strip()
@@ -379,7 +385,9 @@ class CourseIngestor:
                 course_name=course_name,
                 course_id=course_id,
                 published_at=content.get("published_at"),
-                deadline=content.get("deadline") or content.get("available_until"),
+                deadline=content.get("deadline")
+                or (known_deadlines or {}).get(str(content["stable_id"]))
+                or content.get("available_until"),
                 metadata={
                     "idnumber": idnumber,
                     "available_from": content.get("available_from"),

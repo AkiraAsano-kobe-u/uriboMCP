@@ -149,3 +149,31 @@ def test_course_ingestor_keeps_known_name_when_page_title_is_idnumber(
             "SELECT course_name FROM courses WHERE idnumber='C1'"
         ).fetchone()
         assert course["course_name"] == "解析学"
+
+
+class NoDeadlineTestClient(FakeClient):
+    def fetch_course(self, idnumber: str) -> str:
+        return """
+<h1 class="course-title">解析学</h1>
+<article class="contents-item" data-module="test" data-content-id="5">
+  <a href="/lms/course/test/start?idnumber=C1&testId=5">小テスト2</a>
+</article>
+"""
+
+
+def test_task_list_deadline_fills_course_content_without_one(tmp_path: Path) -> None:
+    settings = load_settings(root=tmp_path)
+    with database(settings.paths.db_path) as connection:
+        CourseIngestor(
+            settings=settings,
+            repository=Repository(connection),
+            client=NoDeadlineTestClient(),
+            pause=lambda: None,
+        ).sync_course(
+            idnumber="C1",
+            known_deadlines={"test/C1/5": "2026-12-18T23:59:00"},
+        )
+        row = connection.execute(
+            "SELECT deadline FROM items WHERE source_id='test/C1/5'"
+        ).fetchone()
+        assert row["deadline"] == "2026-12-18T23:59:00"
