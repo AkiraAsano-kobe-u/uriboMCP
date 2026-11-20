@@ -29,8 +29,11 @@ def make_chrome_driver(*, page_load_strategy: str = "normal"):
     options.add_argument("--window-size=1280,2000")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-dev-shm-usage")
-    # macOS: Chrome copies its own app bundle at every launch and removes the copy only on a
-    # normal exit; after driver.quit() the copy stays, one per sync. Do not make it.
+    # On macOS Chrome copies its own app bundle at every launch and removes the copy only on a
+    # normal exit; after driver.quit() the copy stays, one per sync (#6). Do not make it.
+    # Other platforms ignore the unknown feature name. This relies on chromedriver merging the
+    # value into its own switch (seen on 157: IgnoreDuplicateNavs,Prewarm,MacAppCodeSignClone);
+    # Chrome honors only the last --disable-features, so add further features to this value.
     options.add_argument("--disable-features=MacAppCodeSignClone")
     options.set_capability("unhandledPromptBehavior", "dismiss")
     options.page_load_strategy = page_load_strategy
