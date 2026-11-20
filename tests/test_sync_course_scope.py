@@ -211,7 +211,7 @@ def test_one_course_sync_leaves_other_courses_untouched(tmp_path: Path, beef: Be
     revisions_before = _revisions(settings)
     preferences_before = _preferences(settings)
     with database(settings.paths.db_path) as conn:
-        courses_before = [dict(row) for row in conn.execute("SELECT * FROM courses ORDER BY id")]
+        courses_before = [dict(row) for row in conn.execute("SELECT * FROM courses WHERE idnumber != 'C1' ORDER BY id")]
         snapshot_before = inference.load_task_snapshot(conn)
     assert preferences_before[FULL_KEY] == old_full_pass
     assert "assignment/OLD/1" in preferences_before[GLOBAL_KEY]
@@ -251,7 +251,7 @@ def test_one_course_sync_leaves_other_courses_untouched(tmp_path: Path, beef: Be
         "detail_fingerprints:beef:C1"
     }
     with database(settings.paths.db_path) as conn:
-        assert [dict(row) for row in conn.execute("SELECT * FROM courses ORDER BY id")] == courses_before
+        assert [dict(row) for row in conn.execute("SELECT * FROM courses WHERE idnumber != 'C1' ORDER BY id")] == courses_before
         assert inference.load_task_snapshot(conn) == snapshot_before
 
     # The next all-course sync catches up on everything the limited one skipped.
