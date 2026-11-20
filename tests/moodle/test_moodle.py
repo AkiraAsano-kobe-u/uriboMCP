@@ -1306,3 +1306,59 @@ def test_moodle4_submission_status_table_inside_wrapper_div() -> None:
     detail = parse_activity_page(html, base_url=BASE)
     assert detail["submission_status"] == "submitted"
     assert detail["submission_status_text"] == "評定のために提出済み"
+
+
+def test_one_course_run_leaves_other_course_and_full_pass_untouched(tmp_path: Path, monkeypatch) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    import uribo_mcp.live as live
+    from uribo_mcp import sync as sync_module
+
+    settings = load_settings(root=tmp_path)
+    twin = {**ENROLLED[0], "id": 99, "idnumber": "2026_3X004_b", "viewurl": f"{BASE}/course/view.php?id=99"}
+    client = FakeMoodleClient(enrolled=[ENROLLED[0], twin])
+    monkeypatch.setattr(live, "open_moodle", lambda settings: client)
+    monkeypatch.setattr(sync_module.time, "sleep", lambda seconds: None)
+
+    def state():
+        with database(settings.paths.db_path) as conn:
+            revisions = {
+                row["source_id"]: row["n"]
+                for row in conn.execute(
+                    "SELECT source_id, COUNT(*) AS n FROM item_revisions GROUP BY source_id"
+                )
+            }
+            preferences = {
+                row["key"]: row["value"]
+                for row in conn.execute("SELECT key,value FROM user_preferences")
+            }
+        return _rows(settings), revisions, preferences
+
+    assert sync_module._sync_moodle(settings)["full_detail_pass"] is True
+    old = (datetime.now(UTC) - timedelta(hours=sync_module.BEEF_FULL_DETAIL_HOURS + 1)).isoformat()
+    with database(settings.paths.db_path) as conn:
+        sync_module._set_preference(conn, sync_module.MOODLE_FULL_DETAIL_KEY, old)
+    rows_before, revisions_before, preferences_before = state()
+
+    # The page now lacks an activity and the calendar is empty: only the
+    # requested course may notice.
+    client.course_html = _without(COURSE_HTML, "101")
+    client.calendar_month = lambda year, month: []
+    result = sync_module._sync_moodle(settings, course_ids=["2026_3X004_b"])
+
+    assert list(result["courses"]) == ["2026_3X004_b"]
+    assert result["full_detail_pass"] is True and result["courses_unavailable"] == 0
+    rows_after, revisions_after, preferences_after = state()
+    changed = {key for key in rows_before if rows_after[key] != rows_before[key]}
+    assert changed and all("/2026_3X004_b/" in key for key in changed)
+    assert set(rows_after) == set(rows_before)
+    assert {key for key in revisions_after if revisions_after[key] != revisions_before.get(key)} == changed
+    # The full pass stays due for the courses this run skipped.
+    assert preferences_after[sync_module.MOODLE_FULL_DETAIL_KEY] == old
+    assert (
+        preferences_after["detail_fingerprints:moodle:2026_3X004"]
+        == preferences_before["detail_fingerprints:moodle:2026_3X004"]
+    )
+
+    assert sync_module._sync_moodle(settings)["full_detail_pass"] is True
+    assert state()[2][sync_module.MOODLE_FULL_DETAIL_KEY] != old

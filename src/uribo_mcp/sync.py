@@ -75,7 +75,11 @@ def _beef_item_course(
         mapped = info_map.get(information_id)
         if mapped:
             return mapped
-    parts = str(item["source_id"]).split("/")
+    return _source_id_course(str(item["source_id"]))
+
+
+def _source_id_course(source_id: str) -> str | None:
+    parts = source_id.split("/")
     if len(parts) >= 3 and parts[1] not in {"info", "unknown"}:
         return parts[1]
     return None
@@ -551,11 +555,18 @@ def _sync_beef(
             + parse_information_list(pages["information"], info_map)
             + parse_updateinfo(pages["updateinfo"])
         )
-        selected = sorted(
-            set(course_ids or [])
-            or {str(row["idnumber"]) for row in timetable if row.get("idnumber")}
-        )
+        timetable_courses = {
+            str(row["idnumber"]) for row in timetable if row.get("idnumber")
+        }
+        selected = sorted(set(course_ids or []) or timetable_courses)
         selected_courses = set(selected)
+        # A run limited by course_ids changes the requested courses only: it
+        # stores nothing from the global lists, retires no course and leaves
+        # the global fingerprints and the full-detail timestamp as they are.
+        limited = bool(course_ids)
+        # Every timetable course has a course page, whether or not this run
+        # syncs it.
+        course_page_courses = timetable_courses | selected_courses
         # Detail pages are reopened only for rows whose list/course-page summary
         # changed, except for one full pass a day that catches edits only
         # visible on the detail page.
@@ -580,7 +591,7 @@ def _sync_beef(
             # Course pages are the richer canonical source for their own assignments
             # and announcements. Processing the global-list copy as well causes the
             # same item and attachments to oscillate between two representations.
-            if item_course in selected_courses:
+            if limited or item_course in course_page_courses:
                 continue
             source_id = str(item["source_id"])
             fingerprint = summary_fingerprint(item)
@@ -678,7 +689,7 @@ def _sync_beef(
             course_lookup: dict[str, int] = {}
             for row in timetable:
                 idnumber = row.get("idnumber")
-                if not idnumber:
+                if not idnumber or (limited and idnumber not in selected_courses):
                     continue
                 saved = repository.upsert_course(
                     {
@@ -691,9 +702,13 @@ def _sync_beef(
                     }
                 )
                 course_lookup[idnumber] = saved.id
-            missing_course_ids = repository.mark_courses_missing(
-                source="beef",
-                seen_idnumbers=course_lookup,
+            missing_course_ids = (
+                []
+                if limited
+                else repository.mark_courses_missing(
+                    source="beef",
+                    seen_idnumbers=course_lookup,
+                )
             )
             for missing_course_id in missing_course_ids:
                 repository.mark_items_missing(
@@ -704,9 +719,22 @@ def _sync_beef(
             legacy_counts = ingest_items(
                 repository, items, course_lookup=course_lookup
             )
+            current_task_ids = {str(item["source_id"]) for item in tasks}
+            if limited:
+                # Carry the other courses' snapshot entries over untouched so
+                # the next all-course run still sees their tasks disappear.
+                current_task_ids = {
+                    source_id
+                    for source_id in current_task_ids
+                    if _source_id_course(source_id) in selected_courses
+                } | {
+                    source_id
+                    for source_id in inference.load_task_snapshot(conn)
+                    if _source_id_course(source_id) not in selected_courses
+                }
             inference.apply_task_inference(
                 conn,
-                [item["source_id"] for item in tasks],
+                current_task_ids,
                 source="beef",
             )
             ingestor = CourseIngestor(
@@ -750,11 +778,12 @@ def _sync_beef(
                 for task in tasks
                 if task.get("deadline")
             }
-            _set_preference(
-                conn,
-                BEEF_GLOBAL_FINGERPRINT_KEY,
-                canonical_json(new_global_fingerprints),
-            )
+            if not limited:
+                _set_preference(
+                    conn,
+                    BEEF_GLOBAL_FINGERPRINT_KEY,
+                    canonical_json(new_global_fingerprints),
+                )
             for idnumber in selected:
                 course_results[idnumber] = ingestor.sync_course(
                     idnumber=idnumber,
@@ -762,7 +791,7 @@ def _sync_beef(
                     known_deadlines=task_deadlines,
                     skip_unchanged_details=not full_details,
                 )
-            if full_details:
+            if full_details and not limited:
                 _set_preference(conn, BEEF_FULL_DETAIL_KEY, utc_now())
             legacy_counts.pop("seen_source_ids", None)
             return {
@@ -830,7 +859,8 @@ def _sync_moodle(
             pause=lambda: time.sleep(settings.sync.request_interval_seconds),
             skip_unchanged_details=not full,
         ).run(course_ids=course_ids)
-        if full:
+        # A run limited by course_ids is not a full pass over every course.
+        if full and not course_ids:
             _set_preference(conn, MOODLE_FULL_DETAIL_KEY, utc_now())
         return {**result, "full_detail_pass": full}
 
