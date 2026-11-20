@@ -29,6 +29,9 @@ def make_chrome_driver(*, page_load_strategy: str = "normal"):
     options.add_argument("--window-size=1280,2000")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-dev-shm-usage")
+    # macOS: Chrome copies its own app bundle at every launch and removes the copy only on a
+    # normal exit; after driver.quit() the copy stays, one per sync. Do not make it.
+    options.add_argument("--disable-features=MacAppCodeSignClone")
     options.set_capability("unhandledPromptBehavior", "dismiss")
     options.page_load_strategy = page_load_strategy
     driver = webdriver.Chrome(
